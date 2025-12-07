@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-size: 17.5px; /* Slight upscale */
+}
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  body {
+    /* Use raw CSS for color so Tailwind doesn't need a text-ink-strong utility here */
+    background-color: #F3F4F6; /* paper.canvas */
+    color: #0F172A;            /* ink.strong */
+    @apply font-sans antialiased;
+  }
+}
+
+/* Thin, neutral scrollbars for dense tables */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-300 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-slate-400;
+}

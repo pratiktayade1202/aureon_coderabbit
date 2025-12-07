@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: aureon_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: aureon
+      POSTGRES_PASSWORD: aureon123
+      POSTGRES_DB: custody_ai
+    ports:
+      - "5435:5432"
+    volumes:
+      - aureon_postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:alpine
+    container_name: aureon_redis
+    restart: always
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: aureon_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@aureon.ai
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+
+volumes:
+  aureon_postgres_data:
