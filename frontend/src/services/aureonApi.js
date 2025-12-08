@@ -1,8 +1,10 @@
 // frontend/src/services/aureonApi.js
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+/**
+ * Generic request helper with Auth and Error handling
+ */
 async function request(path, { method = "GET", token, body, isFormData = false } = {}) {
   const headers = {};
 
@@ -27,11 +29,15 @@ async function request(path, { method = "GET", token, body, isFormData = false }
   return res.json();
 }
 
-// ---------- Ingestion ----------
+// ==========================================
+// 1. INGESTION (Synchronous)
+// ==========================================
+
 export async function uploadIngestionFile(file, token) {
   const form = new FormData();
   form.append("file", file);
 
+  // We now use the sync endpoint. No need to poll for job IDs anymore.
   return request("/ingestion/upload", {
     method: "POST",
     token,
@@ -40,16 +46,12 @@ export async function uploadIngestionFile(file, token) {
   });
 }
 
-export async function getIngestionStatus(jobId, token) {
-  return request(`/ingestion/status/${jobId}`, { token });
-}
+// ==========================================
+// 2. RECONCILIATION ENGINE
+// ==========================================
 
-export async function getIngestionLogs(jobId, token) {
-  return request(`/ingestion/logs/${jobId}`, { token });
-}
-
-// ---------- Reconciliation ----------
 export async function runReconciliation(token) {
+  // Triggers the Python Rule Engine
   return request("/recon/run", { method: "POST", token });
 }
 
@@ -58,10 +60,41 @@ export async function getBreaks(token) {
 }
 
 export async function clearBreak(breakId, token) {
+  // Manually resolves a break and logs a Learning Event
   return request(`/recon/clear/${breakId}`, { method: "POST", token });
 }
 
-// ---------- Rules ----------
+// ==========================================
+// 3. AI & ANALYSIS
+// ==========================================
+
+export async function getBreakAnalysis(tradeId, token) {
+  // Calls the Co-Pilot to analyze a specific trade/break
+  return request(`/analyze-break/${tradeId}`, { token });
+}
+
+export async function getLearnedRules(token) {
+  // Fetches patterns learned by the AI Agent
+  return request("/learned-rules", { token });
+}
+
+// ==========================================
+// 4. DASHBOARD & SYSTEM
+// ==========================================
+
+export async function getDashboardStats(token) {
+  return request("/dashboard-stats", { token });
+}
+
+export async function resetDatabase(token) {
+  // The "Nuclear Option" - Wipes DB and resets memory
+  return request("/reset-db", { method: "POST", token });
+}
+
+// ==========================================
+// 5. RULE MANAGEMENT (Legacy/Optional)
+// ==========================================
+
 export async function listRules(token) {
   return request("/rules/list", { token });
 }

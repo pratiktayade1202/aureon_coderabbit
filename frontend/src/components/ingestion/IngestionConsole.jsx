@@ -2,11 +2,16 @@
 import React, { useEffect, useRef } from "react";
 
 const IngestionConsole = ({ realLogs = [] }) => {
-  const endRef = useRef(null);
+  const consoleRef = useRef(null);
 
   // Robust Auto-scroll
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (consoleRef.current) {
+      consoleRef.current.scrollTo({
+        top: consoleRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    }
   }, [realLogs]);
 
   return (
@@ -20,25 +25,27 @@ const IngestionConsole = ({ realLogs = [] }) => {
         </p>
       </div>
 
-      {/* CHANGED: Removed flex-1, added h-64 (or h-96) to stop bouncing */}
-      <div className="h-64 max-h-64 bg-paper-surface border border-aureon-border rounded-md p-3 font-mono text-[11px] text-ink-strong overflow-y-auto shadow-inner relative">   
+      <div
+        ref={consoleRef}
+        className="flex-1 bg-paper-surface border border-aureon-border rounded-md p-3 font-mono text-[11px] text-ink-strong overflow-auto shadow-inner"
+      >
         {realLogs.length === 0 ? (
-          <p className="text-ink-muted italic opacity-50 absolute top-3 left-3">
+          <p className="text-ink-muted italic opacity-50">
             System Idle. Waiting for data...
           </p>
         ) : (
-          <div className="flex flex-col gap-1">
-            {realLogs.map((line, idx) => (
-              <div 
-                key={idx} 
-                className="whitespace-pre-wrap border-b border-slate-50 pb-1 break-words"
-              >
-                {line}
-              </div>
-            ))}
-            {/* Invisible element to anchor scrolling */}
-            <div ref={endRef} />
-          </div>
+          realLogs.map((line, idx) => (
+            <div 
+              key={idx} 
+              className={`whitespace-pre-wrap mb-1 break-words border-b border-slate-50/50 pb-0.5
+                ${line.includes("ERROR") || line.includes("❌") ? "text-red-600 font-semibold" : ""}
+                ${line.includes("SUCCESS") || line.includes("✅") ? "text-emerald-700" : ""}
+                ${line.includes("🚀") ? "text-indigo-600 font-semibold" : ""}
+              `}
+            >
+              {line}
+            </div>
+          ))
         )}
       </div>
     </div>

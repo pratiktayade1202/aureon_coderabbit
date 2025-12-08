@@ -432,12 +432,16 @@ class TC_044_MultiLegCandidateRule(BaseRule):
         """
         Heuristic: If Trade Amount is significantly larger than Cash,
         this cash entry might be one of many legs.
-        (Inverse of TC_031).
         """
         t_amt = abs(_to_float(_get(trade, "net_amount")))
         c_amt = abs(_to_float(_get(cash, "amount")))
         
-        if c_amt == 0: return self.pass_rule("Skip")
+        # FIX: Safety check to prevent Division By Zero crash
+        if t_amt == 0: 
+            return self.pass_rule("Skipped (Zero Trade Amount)")
+        
+        if c_amt == 0: 
+            return self.pass_rule("Skip (Zero Cash)")
         
         # If Cash is a neat fraction (e.g., ~50%, ~33%) of Trade
         ratio = c_amt / t_amt

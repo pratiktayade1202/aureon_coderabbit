@@ -16,6 +16,7 @@ export const useAureonApi = () => {
         "Authorization": `Bearer ${token}`,
       };
 
+      // If sending FormData (file upload), let browser set Content-Type
       if (options.body instanceof FormData) {
         delete defaultHeaders["Content-Type"];
       }
@@ -31,12 +32,12 @@ export const useAureonApi = () => {
       const res = await fetch(`${API_BASE}${endpoint}`, config);
 
       if (res.status === 401) throw new Error("Unauthorized");
-      if (res.status === 403) throw new Error("Access Restricted: Waitlist");
+      if (res.status === 403) throw new Error("Access Restricted");
 
       const data = await res.json();
       
       if (!res.ok) {
-        throw new Error(data.message || data.detail || "API Error");
+        throw new Error(data.message || data.detail || `API Error ${res.status}`);
       }
 
       return data;
@@ -50,52 +51,37 @@ export const useAureonApi = () => {
     // 1. DASHBOARD
     getStats: () => request("/dashboard-stats"),
     
-    // 2. INGESTION
-    uploadFile: (formData) => request("/upload", { 
+    // 2. INGESTION (Updated Path)
+    uploadIngestionFile: (formData) => request("/ingestion/upload", { 
       method: "POST", 
       body: formData 
     }),
-    // NEW: Get analysis for specific trade
-    getBreakAnalysis: (tradeId) => request(`/analyze-break/${tradeId}`),
     
-    // 3. ENGINE (Tier 1)
-    getTrades: () => request("/run-engine", { method: "POST" }),
-    runPositionRecon: () => request("/run-positions-check", { method: "POST" }),
+    // 3. ENGINE & RECONCILIATION
+    // Triggers the Orchestrator
+    getTrades: () => request("/recon/run", { method: "POST" }), 
     
-    getHoldings: async (jwt, userId) =>
-      api.get(`/holdings/${userId}`, {
-        headers: { Authorization: `Bearer ${jwt}` },
-      }),
-    getNAV: async (jwt, userId) =>
-      api.get(`/nav/${userId}`, {
-        headers: { Authorization: `Bearer ${jwt}` },
-      }),
+    // Fetches Open Breaks
+    getBreaks: () => request("/recon/breaks"),
     
-    // 4. AI AGENT (Tier 2)
-    runAiResolve: () => request("/run-ai-resolve", { method: "POST" }),
-    getAuditLogs: () => request("/audit-logs"),
+    // 4. AI & TOOLS
+    // Asks AI Agent to analyze a specific trade/break
+    getBreakAnalysis: (tradeId) => request(`/recon/analyze/${tradeId}`),
     
-    // 5. HUMAN INTERVENTION (Tier 3)
-    manualResolve: (tradeId, reason) => request("/manual-resolve", {
+    // Fetches patterns learned by the system
+    getLearnedRules: () => request("/learned-rules"),
+    
+    // 5. MANUAL RESOLUTION
+    // Resolves a trade via the new backend endpoint
+    manualResolve: (tradeId, reason) => request(`/recon/resolve-trade/${tradeId}`, {
       method: "POST",
       body: JSON.stringify({
-        trade_id: tradeId,
-        status: "✅ SETTLED (MANUAL)",
-        reason: reason
+        note: reason // Backend expects 'note' in payload
       })
     }),
-    
-    applySuggestion: (breakId, suggestionId) => request("/apply-suggestion", {
-      method: "POST",
-      body: JSON.stringify({ break_id: breakId, suggestion_id: suggestionId })
-    }),
-    
-    // 6. LEARNER
-    getLearnedRules: () => request("/learned-rules"),
-    learnRules: () => request("/learn-rules", { method: "POST" }),
 
-    // 7. SYSTEM
-    resetDb: () => request("/reset-db", { method: "POST" }),
+    // 6. SYSTEM (Updated Path)
+    resetDb: () => request("/system/reset", { method: "POST" }),
     
   }), [request]); 
 };
