@@ -370,9 +370,22 @@ def _normalize_dates(df: pd.DataFrame, logs: list) -> pd.DataFrame:
 
 
 def _normalize_text_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ["isin", "symbol", "description", "side", "currency", "fund_name", "source_file"]:
+    for col in ["isin", "symbol", "description", "currency", "fund_name", "source_file"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
+    
+    # CRITICAL: Normalize 'side' values to standard BUY/SELL/UNKNOWN
+    if "side" in df.columns:
+        df["side"] = df["side"].fillna("").astype(str).str.upper().str.strip()
+        # Normalize common variations
+        side_map = {
+            "B": "BUY", "BUY": "BUY", "BOUGHT": "BUY", "PURCHASE": "BUY",
+            "S": "SELL", "SELL": "SELL", "SOLD": "SELL", "SALE": "SELL",
+            "CR": "CREDIT", "CREDIT": "CREDIT",
+            "DR": "DEBIT", "DEBIT": "DEBIT",
+        }
+        df["side"] = df["side"].map(lambda x: side_map.get(x, "UNKNOWN"))
+    
     return df
 
 
@@ -410,6 +423,24 @@ def route_and_save(df: pd.DataFrame, filename: str, user_id: str, logs: list, or
     df = _normalize_text_columns(df)
 
     sync_engine = engine
+    
+    # Helper function to log ingestion events for audit trail
+    def _log_ingestion_event(event_type: str, details: str, record_count: int = 0):
+        try:
+            from sqlalchemy import text
+            with sync_engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO recon_logs (tenant_id, reason, status_before, status_after, agent_model)
+                    VALUES (:tid, :reason, :before, :after, :model)
+                """), {
+                    "tid": user_id,
+                    "reason": f"INGESTION: {event_type} - {details} ({record_count} records)",
+                    "before": "FILE_RECEIVED",
+                    "after": event_type,
+                    "model": "INGESTION_PIPELINE"
+                })
+        except Exception as e:
+            logger.debug(f"Failed to log ingestion event: {e}")
 
     # --- DETERMINE FILE TYPE FOR DQ CHECKS ---
     if "nav" in filename:
@@ -477,6 +508,7 @@ def route_and_save(df: pd.DataFrame, filename: str, user_id: str, logs: list, or
             nav_count = len(valid_nav) if not valid_nav.empty else len(df)
             total_aum = df["aum"].sum()
             logs.append(f"[SUCCESS] NAV Data Committed: {nav_count} records, Total AUM: {total_aum:,.2f}")
+            _log_ingestion_event("NAV_IMPORTED", filename, nav_count)
             return "NAV Logs"
 
         # B. HOLDINGS (Critical for AUC calculation)
@@ -571,6 +603,7 @@ def route_and_save(df: pd.DataFrame, filename: str, user_id: str, logs: list, or
                     rows_inserted += 1
             
             logs.append(f"[SUCCESS] Holdings Merge Complete: {rows_inserted} positions saved")
+            _log_ingestion_event("HOLDINGS_IMPORTED", filename, rows_inserted)
             return "Holdings"
 
         # C. CASH
@@ -590,7 +623,9 @@ def route_and_save(df: pd.DataFrame, filename: str, user_id: str, logs: list, or
                         "date": row.get("date"), "vd": row.get("value_date"), "desc": row.get("description", ""),
                         "amt": row.get("amount", 0.0), "src": filename, "tid": user_id
                     })
-            logs.append("[SUCCESS] Cash Ledger Imported")
+            cash_count = len(df)
+            logs.append(f"[SUCCESS] Cash Ledger Imported: {cash_count} transactions")
+            _log_ingestion_event("CASH_IMPORTED", filename, cash_count)
             return "Bank Txns"
 
         # D. TRADES
@@ -617,6 +652,7 @@ def route_and_save(df: pd.DataFrame, filename: str, user_id: str, logs: list, or
             trade_count = len(df)
             df[cols + ["tenant_id"]].to_sql("broker_trades", sync_engine, if_exists="append", index=False)
             logs.append(f"[SUCCESS] Trade Blotter Imported: {trade_count} trades with UNSETTLED status")
+            _log_ingestion_event("TRADES_IMPORTED", filename, trade_count)
             return "Broker Trades"
 
     except Exception as e:
@@ -631,14 +667,16 @@ def _process_single_stream(content: bytes, filename: str, user_id: str, logs: li
     logs.append(f"[INFO] Reading: {filename}")
     filename = filename.lower()
     df = pd.DataFrame()
+    deterministic_parsing_failed = False
 
     try:
+        # STEP 1: Try deterministic parsing first (fast, free)
         if filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(content))
         elif filename.endswith((".xlsx", ".xls")):
             df = pd.read_excel(io.BytesIO(content))
         elif filename.endswith(".pdf"):
-            logs.append("[INFO] Parsing PDF...")
+            logs.append("[INFO] Parsing PDF with pdfplumber...")
             with pdfplumber.open(io.BytesIO(content)) as pdf:
                 rows = []
                 for page in pdf.pages:
@@ -646,10 +684,77 @@ def _process_single_stream(content: bytes, filename: str, user_id: str, logs: li
                     if tbl: rows.extend(tbl)
                 if rows: df = pd.DataFrame(rows[1:], columns=rows[0])
         
+        # STEP 2: If deterministic parsing returned empty, try AI-assisted parsing
+        if df.empty and not filename.endswith(".zip"):
+            logs.append("[AI] ⚠️ Deterministic parsing returned empty data")
+            deterministic_parsing_failed = True
+            
+            # Try to extract text content for AI parsing
+            text_content = None
+            try:
+                if filename.endswith(".pdf"):
+                    with pdfplumber.open(io.BytesIO(content)) as pdf:
+                        text_content = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                elif filename.endswith(".csv"):
+                    text_content = content.decode('utf-8', errors='ignore')
+                elif filename.endswith((".xlsx", ".xls")):
+                    # For Excel, try to read as text
+                    text_content = f"Excel file: {filename}"
+                
+                if text_content and len(text_content.strip()) > 50:
+                    logs.append(f"[AI] 🤖 Attempting Gemini parsing (content length: {len(text_content)} chars)")
+                    
+                    # Determine document type from filename
+                    doc_type = "generic"
+                    if "trade" in filename or "broker" in filename:
+                        doc_type = "trade"
+                    elif "cash" in filename or "bank" in filename or "ledger" in filename:
+                        doc_type = "cash"
+                    elif "holding" in filename or "position" in filename or "portfolio" in filename:
+                        doc_type = "holding"
+                    elif "nav" in filename:
+                        doc_type = "nav"
+                    
+                    # Call Gemini to parse the document
+                    from .llm_gateway import LLMGateway
+                    parsed_data = LLMGateway.parse_document(
+                        content=text_content[:8000],  # Limit to 8K chars
+                        doc_type=doc_type
+                    )
+                    
+                    # Convert parsed JSON to DataFrame
+                    if parsed_data and isinstance(parsed_data, dict):
+                        # Extract the appropriate array from parsed data
+                        data_key = None
+                        if "trades" in parsed_data:
+                            data_key = "trades"
+                        elif "transactions" in parsed_data:
+                            data_key = "transactions"
+                        elif "holdings" in parsed_data:
+                            data_key = "holdings"
+                        elif "nav_records" in parsed_data:
+                            data_key = "nav_records"
+                        
+                        if data_key and parsed_data[data_key]:
+                            df = pd.DataFrame(parsed_data[data_key])
+                            logs.append(f"[AI] ✅ Gemini parsed {len(df)} records from {filename}")
+                        else:
+                            logs.append("[AI] ⚠️ Gemini returned empty data array")
+                    else:
+                        logs.append("[AI] ⚠️ Gemini returned invalid response format")
+                        
+            except Exception as ai_error:
+                logs.append(f"[AI] ⚠️ Gemini parsing failed: {str(ai_error)[:100]}")
+                # Continue with empty DataFrame - will be caught below
+        
         if not df.empty:
             df = normalize_columns(df, logs)
             status = route_and_save(df, filename, user_id, logs)
-            logs.append(f"[SUCCESS] {filename} -> {status}")
+            
+            if deterministic_parsing_failed:
+                logs.append(f"[SUCCESS] {filename} -> {status} (AI-assisted)")
+            else:
+                logs.append(f"[SUCCESS] {filename} -> {status}")
             return status
 
         logs.append(f"[WARNING] Empty/Unreadable: {filename}")

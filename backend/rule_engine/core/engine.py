@@ -104,9 +104,11 @@ class ReconciliationEngine:
                     # Many rules will fail (e.g. "Exact Amount Match"), identifying the break.
                     res = rule.execute(trade, cash, context)
                     
-                    # Pass ID back to Orchestrator
+                    # Pass IDs back to Orchestrator
                     if 'id' in trade:
                         res.details['id'] = trade['id']
+                    if 'id' in cash and cash:
+                        res.details['cash_id'] = cash['id']
                     
                     # Tag the result with our matching logic status
                     res.details['match_algorithm'] = match_status

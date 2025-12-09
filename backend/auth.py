@@ -14,7 +14,7 @@ from fastapi import HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 
-load_dotenv(override=True)  # Override env vars with .env file values
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 

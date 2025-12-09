@@ -66,6 +66,34 @@ def run_reconciliation_process(
             detail=f"Reconciliation failed: {str(e)}"
         )
 
+def _get_resolution_type(bank_ref: str) -> str:
+    """
+    Parse bank_ref to determine resolution type.
+    
+    Bank_ref formats:
+    - "RULE:..." -> RESOLVED_RULE
+    - "MANUAL:..." -> RESOLVED_MANUAL  
+    - "AI:..." -> RESOLVED_AI
+    - Other/empty -> UNKNOWN
+    """
+    if not bank_ref:
+        return "UNKNOWN"
+    
+    bank_ref_upper = bank_ref.upper()
+    if bank_ref_upper.startswith("RULE:"):
+        return "RESOLVED_RULE"
+    elif bank_ref_upper.startswith("MANUAL:"):
+        return "RESOLVED_MANUAL"
+    elif bank_ref_upper.startswith("AI:"):
+        return "RESOLVED_AI"
+    elif "AI MATCHED" in bank_ref_upper or "AI AUTO" in bank_ref_upper:
+        return "RESOLVED_AI"  # Legacy format
+    elif "MATCHED TO CASH" in bank_ref_upper:
+        return "RESOLVED_RULE"  # Legacy format
+    else:
+        return "RESOLVED"  # Generic resolved state
+
+
 @router.get("/trades")
 def get_trades(
     page: int = 1,
@@ -89,7 +117,9 @@ def get_trades(
         date_to: Filter trades until this date (YYYY-MM-DD)
     
     Returns:
-        Paginated response with trades and metadata
+        Paginated response with trades and metadata including:
+        - resolution_type: How the trade was resolved (RULE/MANUAL/AI/UNKNOWN)
+        - resolution_note: Additional context about the resolution
     """
     try:
         # Validate pagination params
@@ -129,14 +159,19 @@ def get_trades(
         # Get paginated results
         trades = query.order_by(BrokerTrade.date.desc()).offset(offset).limit(page_size).all()
         
-        # Format for frontend
-        orchestrator = ReconOrchestrator(db, user_id)
+        # Format for frontend with resolution type information
         formatted_trades = []
         
         for t in trades:
-            display_status = t.status or "UNSETTLED"
-            
-            if t.status == "UNSETTLED":
+            # Determine display status with full context
+            if t.status == "MATCHED":
+                resolution_type = _get_resolution_type(t.bank_ref)
+                display_status = {
+                    "status": "MATCHED",
+                    "resolution_type": resolution_type,
+                }
+            elif t.status == "UNSETTLED" or t.status is None:
+                # Check for open breaks
                 has_break = db.query(ReconBreak).filter_by(
                     trade_id=t.id, 
                     status="OPEN"
@@ -146,11 +181,20 @@ def get_trades(
                         "status": "BREAK",
                         "break_type": has_break.break_type,
                         "severity": has_break.severity.value if has_break.severity else "MEDIUM",
+                        "break_id": has_break.id,
                     }
                 else:
                     display_status = {"status": "UNSETTLED"}
             else:
                 display_status = {"status": t.status}
+            
+            # Extract resolution note (content after the prefix)
+            resolution_note = None
+            if t.bank_ref:
+                if ":" in t.bank_ref:
+                    resolution_note = t.bank_ref.split(":", 1)[1].strip()
+                else:
+                    resolution_note = t.bank_ref
             
             formatted_trades.append({
                 "id": t.id,
@@ -161,6 +205,8 @@ def get_trades(
                 "price": float(to_decimal(t.price)),
                 "amount": float(to_decimal(t.amount)),
                 "status": display_status,
+                "resolution_type": display_status.get("resolution_type") if isinstance(display_status, dict) else None,
+                "resolution_note": resolution_note,
                 "bank_ref": t.bank_ref,
                 "currency": t.currency or "INR",
                 "source_file": t.source_file,
@@ -467,143 +513,154 @@ def run_ai_resolve(
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """
-    Run AI agent to automatically resolve breaks and match unsettled trades.
+    Run AI agent to automatically resolve breaks.
     
-    This endpoint:
-    1. Analyzes all OPEN breaks for potential matches
-    2. Also analyzes UNSETTLED trades without breaks
-    3. Uses GPT-4o-mini for reasoning on ambiguous cases
-    4. Creates audit logs for all resolutions
+    CONFIDENCE THRESHOLDS:
+    - >= 0.85: High confidence, auto-resolve
+    - 0.70-0.85: Medium confidence, logged but not auto-resolved
+    - < 0.70: Low confidence, needs manual review
+    
+    After resolution:
+    - Updates trade status to MATCHED
+    - Updates cash status to MATCHED  
+    - Closes the break
+    - Updates holdings/AUC
+    - Creates audit log entry
     """
+    # Configurable threshold - can be adjusted based on risk tolerance
+    AUTO_RESOLVE_THRESHOLD = 0.85  # Lowered from 0.9 to allow more auto-resolutions
+    
     try:
-        agent = AIAgent(db, user_id, use_llm=True)  # Enable LLM reasoning
+        agent = AIAgent(db, user_id)
         
-        resolved_count = 0
-        analyzed_count = 0
-        
-        # PHASE 1: Handle existing breaks
+        # Get all open breaks with associated trades
         open_breaks = db.query(ReconBreak).filter(
             ReconBreak.tenant_id == user_id,
             ReconBreak.status == "OPEN"
         ).all()
         
+        logger.info(f"AI Auto-Resolve: Processing {len(open_breaks)} open breaks for tenant {user_id}")
+        
+        resolved_count = 0
+        analyzed_count = 0
+        skipped_count = 0
+        low_confidence_count = 0
+        analysis_details = []  # Track what happened for debugging
+        resolved_trade_ids = set()  # Track for holdings update
+        
         for brk in open_breaks:
-            if brk.trade_id:
-                analyzed_count += 1
-                analysis = agent.analyze_single_trade(brk.trade_id)
-                
-                if analysis.get("found") and analysis.get("ai_suggestion", {}).get("confidence", 0) > 0.9:
-                    best_candidate = analysis.get("best_candidate")
-                    if best_candidate:
-                        # Update trade and cash status
-                        db.execute(
-                            text("""
-                                UPDATE broker_trades 
-                                SET status = 'MATCHED', 
-                                    bank_ref = :ref
-                                WHERE id = :id AND tenant_id = :tid
-                            """),
-                            {
-                                "ref": f"AI-{best_candidate.get('id', 'N/A')}",
-                                "id": brk.trade_id,
-                                "tid": user_id
-                            }
-                        )
-                        
-                        if best_candidate.get("id"):
-                            db.execute(
-                                text("""
-                                    UPDATE bank_txns 
-                                    SET status = 'MATCHED', trade_ref = :trade_id
-                                    WHERE id = :id AND tenant_id = :tid
-                                """),
-                                {
-                                    "id": best_candidate["id"],
-                                    "trade_id": brk.trade_id,
-                                    "tid": user_id
-                                }
-                            )
-                        
-                        # Mark break as resolved
-                        brk.status = "RESOLVED"
-                        brk.resolution_note = f"AI Auto-Resolved: {analysis.get('ai_suggestion', {}).get('explanation', '')}"
-                        
-                        # Create audit log
-                        audit_log = ReconLog(
-                            tenant_id=user_id,
-                            trade_id=brk.trade_id,
-                            cash_id=best_candidate.get("id"),
-                            rule_id="AI_RESOLVE",
-                            status_before="OPEN",
-                            status_after="RESOLVED",
-                            reason=f"AI matched with confidence {analysis.get('ai_suggestion', {}).get('confidence', 0):.2f}",
-                            agent_model="GPT-4o-mini"
-                        )
-                        db.add(audit_log)
-                        resolved_count += 1
-        
-        # PHASE 2: Also try to match UNSETTLED trades without breaks
-        unsettled_trades = db.query(BrokerTrade).filter(
-            BrokerTrade.tenant_id == user_id,
-            BrokerTrade.status.in_(["UNSETTLED", None])
-        ).limit(100).all()
-        
-        for trade in unsettled_trades:
-            # Skip if already has an open break (handled above)
-            has_break = db.query(ReconBreak).filter_by(
-                trade_id=trade.id, 
-                status="OPEN"
-            ).first()
-            if has_break:
+            if not brk.trade_id:
+                skipped_count += 1
                 continue
-            
+                
             analyzed_count += 1
-            analysis = agent.analyze_single_trade(trade.id)
             
-            if analysis.get("found") and analysis.get("ai_suggestion", {}).get("confidence", 0) > 0.9:
-                best_candidate = analysis.get("best_candidate")
-                if best_candidate:
-                    # Update trade and cash status
+            # Analyze the trade using AI agent
+            analysis = agent.analyze_single_trade(brk.trade_id)
+            
+            confidence = analysis.get("ai_suggestion", {}).get("confidence", 0)
+            action = analysis.get("ai_suggestion", {}).get("action", "ESCALATE")
+            explanation = analysis.get("ai_suggestion", {}).get("explanation", "")
+            best_candidate = analysis.get("best_candidate")
+            
+            logger.info(f"Trade {brk.trade_id}: confidence={confidence:.2f}, action={action}, candidates={analysis.get('candidates_count', 0)}")
+            
+            detail = {
+                "trade_id": brk.trade_id,
+                "break_id": brk.id,
+                "confidence": confidence,
+                "action": action,
+                "resolved": False,
+                "reason": explanation[:100] if explanation else "No explanation"
+            }
+            
+            # Check if we should auto-resolve
+            if analysis.get("found") and confidence >= AUTO_RESOLVE_THRESHOLD and best_candidate:
+                # High confidence match - auto-resolve
+                trade = db.query(BrokerTrade).filter_by(
+                    id=brk.trade_id, 
+                    tenant_id=user_id
+                ).first()
+                
+                if trade and trade.status != "MATCHED":
+                    # Update trade status
                     trade.status = "MATCHED"
-                    trade.bank_ref = f"AI-{best_candidate.get('id', 'N/A')}"
+                    trade.bank_ref = f"AI:{explanation[:50]}... (conf: {confidence:.2f})"
                     
-                    if best_candidate.get("id"):
-                        db.execute(
-                            text("""
-                                UPDATE bank_txns 
-                                SET status = 'MATCHED', trade_ref = :trade_id
-                                WHERE id = :id AND tenant_id = :tid
-                            """),
-                            {
-                                "id": best_candidate["id"],
-                                "trade_id": trade.id,
-                                "tid": user_id
-                            }
-                        )
+                    # Update cash status if we have a match
+                    cash_id = best_candidate.get("id")
+                    if cash_id:
+                        cash = db.query(BankTxn).filter_by(
+                            id=cash_id, 
+                            tenant_id=user_id
+                        ).first()
+                        if cash:
+                            cash.status = "MATCHED"
+                            cash.trade_ref = trade.id
+                    
+                    # Mark break as resolved
+                    brk.status = "RESOLVED"
+                    brk.resolution_note = f"AI:{explanation[:150]}"
+                    
+                    # Track for holdings update
+                    resolved_trade_ids.add(trade.id)
+                    resolved_count += 1
+                    detail["resolved"] = True
                     
                     # Create audit log
                     audit_log = ReconLog(
                         tenant_id=user_id,
                         trade_id=trade.id,
-                        cash_id=best_candidate.get("id"),
-                        rule_id="AI_RESOLVE",
+                        cash_id=cash_id,
+                        reason=f"AUTO_RESOLVE: {explanation[:150]}",
                         status_before="UNSETTLED",
                         status_after="MATCHED",
-                        reason=f"AI matched: {analysis.get('ai_suggestion', {}).get('explanation', '')}",
-                        agent_model="GPT-4o-mini"
+                        agent_model=f"AI_AGENT (conf: {confidence:.2f})",
                     )
                     db.add(audit_log)
-                    resolved_count += 1
+                    
+                    logger.info(f"✓ Auto-resolved trade {trade.id} with confidence {confidence:.2f}")
+            else:
+                # Low confidence - log but don't resolve
+                low_confidence_count += 1
+                detail["reason"] = f"Below threshold ({confidence:.2f} < {AUTO_RESOLVE_THRESHOLD})"
+                
+                # Still log the analysis attempt for audit
+                audit_log = ReconLog(
+                    tenant_id=user_id,
+                    trade_id=brk.trade_id,
+                    reason=f"AI_REVIEW_NEEDED: {explanation[:100]}",
+                    status_before="OPEN",
+                    status_after="REVIEW",
+                    agent_model=f"AI_AGENT (conf: {confidence:.2f})",
+                )
+                db.add(audit_log)
+            
+            analysis_details.append(detail)
+        
+        # Apply holdings updates for all resolved trades
+        if resolved_trade_ids:
+            from .rule_engine.orchestrator import ReconOrchestrator
+            orchestrator = ReconOrchestrator(db, user_id)
+            for trade_id in resolved_trade_ids:
+                trade = db.query(BrokerTrade).filter_by(id=trade_id, tenant_id=user_id).first()
+                if trade:
+                    orchestrator._apply_single_trade_to_holdings(trade)
         
         db.commit()
-        logger.info(f"AI Resolve: Analyzed {analyzed_count} trades, resolved {resolved_count}")
+        
+        logger.info(f"AI Auto-Resolve complete: {resolved_count}/{analyzed_count} resolved, {low_confidence_count} low confidence")
         
         return {
             "status": "success",
             "resolved": resolved_count,
-            "analyzed": analyzed_count,
             "total_breaks": len(open_breaks),
-            "message": f"AI analyzed {analyzed_count} trades, resolved {resolved_count}"
+            "analyzed": analyzed_count,
+            "skipped": skipped_count,
+            "low_confidence": low_confidence_count,
+            "threshold_used": AUTO_RESOLVE_THRESHOLD,
+            "message": f"Resolved {resolved_count} of {analyzed_count} analyzed breaks using AI (threshold: {AUTO_RESOLVE_THRESHOLD})",
+            "details": analysis_details[:20]  # Return first 20 for debugging
         }
     except Exception as e:
         db.rollback()
@@ -624,6 +681,10 @@ def manual_resolve_trade(
     """
     Manual resolution endpoint used by BreakDrawer.
     Allows analysts to match a trade to a cash entry or mark it settled with a note.
+    
+    ECONOMIC BEHAVIOR:
+    - BUY trades INCREASE holdings/AUC
+    - SELL trades DECREASE holdings/AUC
     """
     trade = (
         db.query(BrokerTrade)
@@ -632,6 +693,14 @@ def manual_resolve_trade(
     )
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
+
+    # Check if trade is already resolved
+    if trade.status == "MATCHED":
+        return {
+            "status": "warning", 
+            "message": "Trade is already resolved", 
+            "trade_id": trade_id
+        }
 
     cash_record = None
     if payload.cash_id is not None:
@@ -645,8 +714,9 @@ def manual_resolve_trade(
 
     note = payload.note or "MANUAL RESOLVE"
     try:
+        # Update trade status with MANUAL prefix for resolution tracking
         trade.status = "MATCHED"
-        trade.bank_ref = note
+        trade.bank_ref = f"MANUAL:{note}"
 
         if cash_record:
             cash_record.status = "MATCHED"
@@ -660,26 +730,67 @@ def manual_resolve_trade(
         ).all()
         for brk in open_breaks:
             brk.status = "RESOLVED"
-            brk.resolution_note = note
+            brk.resolution_note = f"MANUAL:{note}"
 
         # Write learning event so Neural Core can retrain later
+        # CRITICAL: Use source="HUMAN_MANUAL" so learner.py can find it
         learning_event = LearningEvent(
             tenant_id=user_id,
             trade_id=trade.id,
             status="MANUAL_RESOLVED",
-            source="Analyst",
+            source="HUMAN_MANUAL",  # Fixed: was "Analyst", learner looks for "HUMAN_MANUAL"
             trade_data={
                 "symbol": trade.symbol,
-                "amount": trade.amount,
+                "amount": float(trade.amount) if trade.amount else 0,
                 "side": trade.side,
-                "quantity": trade.quantity,
+                "quantity": float(trade.quantity) if trade.quantity else 0,
+                "price": float(trade.price) if trade.price else 0,
+                "date": trade.date.isoformat() if trade.date else None,
+                "cash_id": cash_record.id if cash_record else None,
+                "cash_amount": float(cash_record.amount) if cash_record else None,
             },
             correction_notes=note,
         )
         db.add(learning_event)
+        
+        # CRITICAL FIX: Apply this single trade to holdings
+        # Uses the new method that correctly handles BUY vs SELL
+        from .rule_engine.orchestrator import ReconOrchestrator
+        orchestrator = ReconOrchestrator(db, user_id)
+        orchestrator._apply_single_trade_to_holdings(trade)
+        
+        # Log the manual resolution for audit trail
+        audit_log = ReconLog(
+            tenant_id=user_id,
+            trade_id=trade.id,
+            cash_id=cash_record.id if cash_record else None,
+            reason=f"MANUAL_RESOLVE: {note}",
+            status_before="UNSETTLED",
+            status_after="MATCHED",
+            agent_model="MANUAL",
+        )
+        db.add(audit_log)
 
         db.commit()
-        return {"status": "success", "message": "Trade resolved", "trade_id": trade_id}
+        
+        # Calculate AUC delta for response
+        holding = db.query(Holding).filter(
+            Holding.tenant_id == user_id,
+            Holding.symbol == trade.symbol
+        ).first()
+        
+        return {
+            "status": "success", 
+            "message": "Trade resolved and holdings updated", 
+            "trade_id": trade_id,
+            "resolution_type": "MANUAL",
+            "auc_updated": True,
+            "holding_after": {
+                "symbol": trade.symbol,
+                "quantity": float(holding.quantity) if holding else 0,
+                "total_value": float(holding.total_value) if holding else 0,
+            } if holding else None
+        }
     except Exception as e:
         db.rollback()
         logger.error(f"Manual resolve failed: {str(e)}", exc_info=True)

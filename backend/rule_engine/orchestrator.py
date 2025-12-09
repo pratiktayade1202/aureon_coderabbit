@@ -187,8 +187,8 @@ class ReconOrchestrator:
             
             return {
                 "status": "success",
-                "matches": report.get("matches", 0),
-                "breaks": report.get("breaks", 0),
+                "matches": report.get("match_count", 0),
+                "breaks": report.get("break_count", 0),
                 "run_id": self.run_id,
                 "details": report
             }
@@ -202,8 +202,15 @@ class ReconOrchestrator:
     def _apply_trade_results(self, report: Dict, trades_data: List[Dict], cash_data: List[Dict]):
         """
         Updates Status in DB based on Engine Results with transaction safety.
+        
+        Critical behavior:
+        - Process matches from reconciliation engine
+        - Create breaks for rules that failed
+        - Generate breaks for ANY trade that remains unmatched after all processing
+        - Update holdings ONLY for newly matched trades in this run
         """
         broken_trade_ids = set()
+        matched_trade_ids = set()  # Track trades matched in THIS run (for holdings update)
         matched_count = 0
         
         # 1. Process Breaks (Failed Validation)
@@ -224,9 +231,10 @@ class ReconOrchestrator:
                     try:
                         # Update trade status
                         trade = self.db.query(BrokerTrade).filter_by(id=t_id, tenant_id=self.tenant_id).first()
-                        if trade:
+                        if trade and trade.status != "MATCHED":
                             trade.status = "MATCHED"
-                            trade.bank_ref = f"Matched to Cash {c_id} (Run: {self.run_id})"
+                            trade.bank_ref = f"RULE:Matched to Cash {c_id} (Run: {self.run_id})"
+                            matched_trade_ids.add(t_id)  # Track for holdings update
                         
                         # Update cash transaction status
                         cash = self.db.query(BankTxn).filter_by(id=c_id, tenant_id=self.tenant_id).first()
@@ -241,6 +249,7 @@ class ReconOrchestrator:
                             "trade_id": t_id,
                             "cash_id": c_id,
                             "run_id": self.run_id,
+                            "resolution_type": "RULE",
                         })
                         
                     except Exception as e:
@@ -251,7 +260,7 @@ class ReconOrchestrator:
         if matched_count == 0 and len(trades_data) > 0 and len(cash_data) > 0:
             for t_data in trades_data:
                 t_id = t_data.get('id')
-                if t_id in broken_trade_ids:
+                if t_id in broken_trade_ids or t_id in matched_trade_ids:
                     continue
                 
                 t_amount = float(t_data.get('amount', 0) or t_data.get('net_amount', 0))
@@ -272,7 +281,8 @@ class ReconOrchestrator:
                             trade = self.db.query(BrokerTrade).filter_by(id=t_id, tenant_id=self.tenant_id).first()
                             if trade and trade.status != "MATCHED":
                                 trade.status = "MATCHED"
-                                trade.bank_ref = f"Matched to Cash {c_id} (Run: {self.run_id})"
+                                trade.bank_ref = f"RULE:Matched to Cash {c_id} (Run: {self.run_id})"
+                                matched_trade_ids.add(t_id)  # Track for holdings update
                                 
                                 cash = self.db.query(BankTxn).filter_by(id=c_id, tenant_id=self.tenant_id).first()
                                 if cash:
@@ -284,13 +294,45 @@ class ReconOrchestrator:
                                 break
                         except Exception as e:
                             logger.error(f"Fallback match error: {str(e)}")
+        
+        # 4. CRITICAL: Create breaks for ALL remaining unmatched trades
+        # This ensures unresolved items are visible in the Breaks UI
+        unmatched_break_count = 0
+        for t_data in trades_data:
+            t_id = t_data.get('id')
+            
+            # Skip if already matched or already has a break
+            if t_id in matched_trade_ids or t_id in broken_trade_ids:
+                continue
+            
+            # Create a NO_MATCH_FOUND break for this unresolved trade
+            try:
+                logger.info(f"Creating NO_MATCH_FOUND break for unresolved trade {t_id}")
+                self._create_db_break(
+                    {
+                        "rule_id": "NO_MATCH",
+                        "break_type": "NO_MATCH_FOUND",
+                        "severity": "MEDIUM",
+                        "amount_diff": float(t_data.get('amount', 0)),
+                        "message": f"Trade could not be matched to any cash entry (Amount: {t_data.get('amount')})"
+                    },
+                    trade_id=t_id
+                )
+                broken_trade_ids.add(t_id)
+                unmatched_break_count += 1
+            except Exception as e:
+                logger.error(f"Failed to create break for unmatched trade {t_id}: {str(e)}")
+        
+        if unmatched_break_count > 0:
+            logger.info(f"Created {unmatched_break_count} breaks for unmatched trades")
 
-        # 4. Update holdings based on matched trades
-        self._update_holdings_from_matches(broken_trade_ids)
+        # 5. Update holdings ONLY for trades matched in THIS run
+        # CRITICAL: Do NOT pass broken_trade_ids - pass newly matched trade IDs
+        self._update_holdings_from_matches(matched_trade_ids)
         
         # Commit all changes
         self.db.commit()
-        logger.info(f"Applied {matched_count} matches")
+        logger.info(f"Applied {matched_count} matches, created {len(broken_trade_ids)} breaks")
 
     def _create_db_break(self, break_data: Dict, trade_id: int = None, cash_id: int = None):
         """
@@ -334,64 +376,155 @@ class ReconOrchestrator:
             "severity": new_break.severity.value,
         })
 
-    def _update_holdings_from_matches(self, broken_trade_ids: set):
+    def _update_holdings_from_matches(self, newly_matched_trade_ids: set):
         """
-        Update holdings based on matched trades.
+        Update holdings based on NEWLY matched trades only.
+        
+        CRITICAL: This function should only be called with the set of trade IDs
+        that were matched in THIS reconciliation run. It should NOT re-process
+        all matched trades, as that would cause incorrect AUC accumulation.
+        
+        Args:
+            newly_matched_trade_ids: Set of trade IDs that were matched in this run
+        """
+        if not newly_matched_trade_ids:
+            logger.debug("No newly matched trades to update holdings for")
+            return
+            
+        try:
+            for trade_id in newly_matched_trade_ids:
+                trade = self.db.query(BrokerTrade).filter_by(
+                    id=trade_id, 
+                    tenant_id=self.tenant_id
+                ).first()
+                
+                if trade:
+                    self._apply_single_trade_to_holdings(trade)
+                    
+        except Exception as e:
+            logger.error(f"Failed to update holdings: {str(e)}")
+
+    def _apply_single_trade_to_holdings(self, trade: BrokerTrade) -> None:
+        """
+        Apply a single trade's position change to holdings.
+        
+        ECONOMIC LOGIC:
+        - BUY trades INCREASE holdings (quantity and value go UP)
+        - SELL trades DECREASE holdings (quantity and value go DOWN)
+        
+        This method should be called ONCE per trade when it's resolved.
+        It handles both creating new holdings and updating existing ones.
+        
+        Args:
+            trade: The BrokerTrade to apply to holdings
         """
         try:
-            # Get all matched trades for this tenant
-            matched_trades = self.db.query(BrokerTrade).filter(
-                BrokerTrade.tenant_id == self.tenant_id,
-                BrokerTrade.status == 'MATCHED',
-                BrokerTrade.id.notin_(broken_trade_ids) if broken_trade_ids else True
-            ).all()
+            # Normalize quantity to positive value
+            quantity = abs(to_decimal(trade.quantity))
+            price = to_decimal(trade.price)
             
-            for trade in matched_trades:
-                # Calculate position change
-                quantity_change = to_decimal(trade.quantity)
-                if trade.side in ['SELL', 'S', 'DEBIT', 'DR']:
-                    quantity_change = -quantity_change
+            # Determine sign based on trade side
+            # BUY = +quantity (increase holdings)
+            # SELL = -quantity (decrease holdings)
+            side_upper = (trade.side or "").upper()
+            
+            if side_upper in ['BUY', 'B', 'CREDIT', 'CR', 'PURCHASE']:
+                quantity_change = quantity  # Positive: adds to holdings
+            elif side_upper in ['SELL', 'S', 'DEBIT', 'DR', 'SALE']:
+                quantity_change = -quantity  # Negative: reduces holdings
+            else:
+                # Unknown side - log warning and skip
+                logger.warning(f"Unknown trade side '{trade.side}' for trade {trade.id}, skipping holdings update")
+                return
+            
+            # Calculate value change (same sign as quantity change)
+            value_change = quantity_change * price
+            
+            logger.info(f"Applying trade {trade.id}: {trade.symbol} {trade.side} qty={quantity} @ {price} -> delta={quantity_change}")
+            
+            # Get or create holding for this symbol
+            holding = self.db.query(Holding).filter(
+                Holding.tenant_id == self.tenant_id,
+                Holding.symbol == trade.symbol
+            ).first()
+            
+            if holding:
+                # Update existing holding
+                old_quantity = to_decimal(holding.quantity)
+                new_quantity = old_quantity + quantity_change
                 
-                # Get or create holding (use most recent date)
-                holding = self.db.query(Holding).filter(
-                    Holding.tenant_id == self.tenant_id,
-                    Holding.symbol == trade.symbol
-                ).order_by(Holding.date.desc()).first()
+                # Prevent negative holdings (would indicate data issue)
+                if new_quantity < Decimal('0'):
+                    logger.warning(
+                        f"Trade {trade.id} would make {trade.symbol} holdings negative "
+                        f"({old_quantity} + {quantity_change} = {new_quantity}). Clamping to 0."
+                    )
+                    new_quantity = Decimal('0')
                 
-                if holding:
-                    # Update existing holding
-                    new_quantity = to_decimal(holding.quantity) + quantity_change
-                    
-                    # Don't allow negative holdings
-                    if new_quantity < Decimal('0'):
-                        logger.warning(f"Negative holding prevented for {trade.symbol}")
-                        new_quantity = Decimal('0')
-                    
-                    holding.quantity = float(new_quantity)
-                    holding.total_value = float(new_quantity * to_decimal(holding.market_price))
-                    holding.date = date.today()  # Update to current date
-                else:
-                    # Create new holding
+                # Update quantity and total value
+                holding.quantity = float(new_quantity)
+                holding.total_value = float(new_quantity * to_decimal(holding.market_price or price))
+                holding.date = date.today()
+                
+                logger.info(f"Updated holding {trade.symbol}: {old_quantity} -> {new_quantity} (AUC: {holding.total_value})")
+            else:
+                # Create new holding (only for BUY, SELL with no existing holding is unusual)
+                if quantity_change > 0:
                     holding = Holding(
                         tenant_id=self.tenant_id,
                         date=date.today(),
                         symbol=trade.symbol,
                         isin=trade.isin,
                         quantity=float(quantity_change),
-                        avg_cost=float(to_decimal(trade.price)),
-                        market_price=float(to_decimal(trade.price)),
-                        total_value=float(quantity_change * to_decimal(trade.price)),
+                        avg_cost=float(price),
+                        market_price=float(price),
+                        total_value=float(value_change),
                         source_file=trade.source_file,
                     )
                     self.db.add(holding)
+                    logger.info(f"Created new holding {trade.symbol}: qty={quantity_change}, value={value_change}")
+                else:
+                    logger.warning(f"SELL trade {trade.id} for {trade.symbol} but no existing holding found")
+            
+            # Log the holdings update for audit trail
+            self._log_reconciliation_event("HOLDINGS_UPDATED", {
+                "trade_id": trade.id,
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "quantity_change": float(quantity_change),
+                "value_change": float(value_change),
+            })
                     
         except Exception as e:
-            logger.error(f"Failed to update holdings: {str(e)}")
+            logger.error(f"Failed to apply trade {trade.id} to holdings: {str(e)}")
+
+    def _get_resolution_type(self, bank_ref: str) -> str:
+        """
+        Parse bank_ref to determine resolution type.
+        """
+        if not bank_ref:
+            return "UNKNOWN"
+        
+        bank_ref_upper = bank_ref.upper()
+        if bank_ref_upper.startswith("RULE:"):
+            return "RESOLVED_RULE"
+        elif bank_ref_upper.startswith("MANUAL:"):
+            return "RESOLVED_MANUAL"
+        elif bank_ref_upper.startswith("AI:"):
+            return "RESOLVED_AI"
+        elif "AI MATCHED" in bank_ref_upper:
+            return "RESOLVED_AI"
+        elif "MATCHED TO CASH" in bank_ref_upper:
+            return "RESOLVED_RULE"
+        else:
+            return "RESOLVED"
 
     def get_frontend_trade_view(self) -> List[Dict]:
         """
         CRITICAL: Maps DB models to the specific JSON shape 
         expected by frontend/src/components/DataTable.jsx
+        
+        Returns structured status with resolution_type for matched trades.
         """
         trades = self.db.query(BrokerTrade).filter(
             BrokerTrade.tenant_id == self.tenant_id
@@ -399,26 +532,36 @@ class ReconOrchestrator:
 
         results = []
         for t in trades:
-            # STATUS MAPPING for Badge Colors
-            display_status = t.status or "UNSETTLED"
-            
-            # Check if it has an open break
-            if t.status == "UNSETTLED":
+            # Determine display status with full context
+            if t.status == "MATCHED":
+                resolution_type = self._get_resolution_type(t.bank_ref)
+                display_status = {
+                    "status": "MATCHED",
+                    "resolution_type": resolution_type,
+                }
+            elif t.status == "UNSETTLED" or t.status is None:
                 has_break = self.db.query(ReconBreak).filter_by(
                     trade_id=t.id, 
                     status="OPEN"
                 ).first()
                 if has_break:
-                    # Return structured data, not emoji string
                     display_status = {
                         "status": "BREAK",
                         "break_type": has_break.break_type,
-                        "severity": has_break.severity.value,
+                        "severity": has_break.severity.value if has_break.severity else "MEDIUM",
+                        "break_id": has_break.id,
                     }
                 else:
                     display_status = {"status": "UNSETTLED"}
             else:
                 display_status = {"status": t.status}
+
+            # Extract resolution note
+            resolution_note = None
+            if t.bank_ref and ":" in t.bank_ref:
+                resolution_note = t.bank_ref.split(":", 1)[1].strip()
+            elif t.bank_ref:
+                resolution_note = t.bank_ref
 
             results.append({
                 "id": t.id,
@@ -428,7 +571,9 @@ class ReconOrchestrator:
                 "quantity": float(to_decimal(t.quantity)),
                 "price": float(to_decimal(t.price)),
                 "amount": float(to_decimal(t.amount)),
-                "status": display_status,  # Now a structured object
+                "status": display_status,
+                "resolution_type": display_status.get("resolution_type") if isinstance(display_status, dict) else None,
+                "resolution_note": resolution_note,
                 "bank_ref": t.bank_ref,
                 "currency": t.currency or "INR",
                 "source_file": t.source_file,

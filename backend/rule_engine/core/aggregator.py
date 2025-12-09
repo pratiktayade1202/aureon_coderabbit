@@ -28,11 +28,13 @@ class ResultAggregator:
             "break_count": 0,
             "breaks": [],
             "warnings": [],
+            "matches": [],  # Track successful matches for orchestrator
             "ai_training_payloads": [], # For Phase 2
             "domain_summary": {}
         }
         
         total_weight = 0
+        matched_trade_ids = set()  # Track trades that passed all rules
         
         for res in results:
             # 1. Update Domain Summary
@@ -48,6 +50,23 @@ class ResultAggregator:
                 report["domain_summary"][domain]["passed"] += 1
                 total_weight += 1
                 report["score_total"] += 1
+                
+                # Track successful trade-cash matches
+                # Only add to matches if this is a trade-cash pairing rule and both IDs exist
+                if (res.details.get("match_algorithm") == "PROPOSED_MATCH" and 
+                    "id" in res.details and 
+                    res.details.get("domain") in ["TRADE_CASH", "TRADES"]):
+                    trade_id = res.details.get("id")
+                    cash_id = res.details.get("cash_id")
+                    
+                    if trade_id and cash_id and trade_id not in matched_trade_ids:
+                        report["matches"].append({
+                            "trade_id": trade_id,
+                            "cash_id": cash_id,
+                            "rule_id": res.rule_id,
+                            "confidence": 1.0 if res.score == 1.0 else 0.95
+                        })
+                        matched_trade_ids.add(trade_id)
             else:
                 report["domain_summary"][domain]["failed"] += 1
                 total_weight += 1
@@ -88,5 +107,8 @@ class ResultAggregator:
             report["final_score_pct"] = (report["score_total"] / total_weight) * 100
         else:
             report["final_score_pct"] = 100.0
+        
+        # Add match summary
+        report["match_count"] = len(report["matches"])
 
         return report

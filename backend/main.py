@@ -7,10 +7,12 @@ import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, APIRouter, Request
+from fastapi import FastAPI, APIRouter, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
 
 from .database import engine, Base
@@ -92,35 +94,128 @@ app.add_middleware(
 )
 
 
-# --- GLOBAL ERROR HANDLER ---
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
+# --- GLOBAL ERROR HANDLERS ---
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """
-    Global exception handler for unhandled errors.
-    Ensures consistent error response format.
+    Handle HTTP exceptions (404, 403, etc.) with consistent format.
     """
     request_id = getattr(request.state, "request_id", "unknown")
     
-    logger.error(
-        f"Unhandled exception: {str(exc)}",
+    logger.warning(
+        f"HTTP {exc.status_code}: {exc.detail}",
         extra={
             "request_id": request_id,
             "path": request.url.path,
             "method": request.method,
-        },
-        exc_info=True
+        }
     )
     
-    # Don't leak internal details in production
-    detail = str(exc) if settings.environment == "development" else "Internal server error"
-    
     return JSONResponse(
-        status_code=500,
+        status_code=exc.status_code,
         content={
             "status": "error",
-            "message": detail,
+            "message": exc.detail,
             "request_id": request_id,
+            "error_code": f"HTTP_{exc.status_code}"
         },
+        headers={"X-Request-ID": request_id}
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Handle request validation errors (Pydantic validation failures).
+    Returns structured error with field-level details.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    
+    # Extract validation errors
+    errors = []
+    for error in exc.errors():
+        field = " -> ".join(str(loc) for loc in error["loc"])
+        errors.append({
+            "field": field,
+            "message": error["msg"],
+            "type": error["type"]
+        })
+    
+    logger.warning(
+        f"Validation error: {len(errors)} field(s) failed validation",
+        extra={
+            "request_id": request_id,
+            "path": request.url.path,
+            "method": request.method,
+            "errors": errors
+        }
+    )
+    
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "status": "error",
+            "message": "Request validation failed",
+            "request_id": request_id,
+            "error_code": "VALIDATION_ERROR",
+            "details": errors
+        },
+        headers={"X-Request-ID": request_id}
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """
+    Global exception handler for all unhandled errors.
+    
+    This is the last line of defense - catches any exception that wasn't
+    handled by more specific handlers. Logs full stack trace but returns
+    sanitized error to client.
+    
+    CRITICAL: Never returns raw exception messages in production to avoid
+    leaking sensitive information (DB connection strings, API keys, etc.)
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+    
+    # Log full exception with stack trace server-side
+    logger.error(
+        f"💥 UNHANDLED EXCEPTION: {exc.__class__.__name__}: {str(exc)}",
+        extra={
+            "request_id": request_id,
+            "path": request.url.path,
+            "method": request.method,
+            "exception_type": exc.__class__.__name__,
+        },
+        exc_info=True  # Include full stack trace in logs
+    )
+    
+    # Determine error message based on environment
+    if settings.environment == "development":
+        # In development, show detailed error for debugging
+        detail = f"{exc.__class__.__name__}: {str(exc)}"
+        include_traceback = True
+    else:
+        # In production, show generic message to avoid leaking internals
+        detail = "An internal server error occurred. Please contact support if the issue persists."
+        include_traceback = False
+    
+    response_content = {
+        "status": "error",
+        "message": detail,
+        "request_id": request_id,
+        "error_code": "INTERNAL_SERVER_ERROR",
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
+    
+    # Only include exception type in development
+    if include_traceback:
+        response_content["exception_type"] = exc.__class__.__name__
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=response_content,
         headers={"X-Request-ID": request_id}
     )
 

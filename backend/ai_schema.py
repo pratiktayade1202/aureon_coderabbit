@@ -1,12 +1,9 @@
 # backend/ai_schema.py
 """
-AI-powered schema mapping using Gemini 1.5 Flash 8B.
+AI-powered schema mapping using Gemini 2.5 Flash Lite.
 
 This module provides intelligent column mapping for messy financial data files,
 enabling Aureon to ingest files with non-standard headers automatically.
-
-Uses gemini-1.5-flash-8b: lightweight 8B parameter model optimized for
-high-throughput parsing tasks with lower latency and cost.
 """
 import os
 import json
@@ -17,17 +14,14 @@ from datetime import datetime, timezone
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-load_dotenv(override=True)  # Override env vars with .env file values
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Configure Gemini - use 1.5-flash-8b for lightweight parsing
+# Configure Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-8b")  # Lighter model for parsing
-
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    logger.info(f"Gemini configured with model: {GEMINI_MODEL}")
 else:
     logger.warning("GEMINI_API_KEY not set - AI schema mapping will be disabled")
 
@@ -105,13 +99,13 @@ def get_smart_mapping(headers: list) -> dict:
         logger.warning(f"[AI] Skipping Gemini call: {rl_err}")
         return {}
     
-    # --- CALL GEMINI 1.5 FLASH 8B ---
-    logger.info(f"🧠 Gemini ({GEMINI_MODEL}) analyzing {len(headers)} columns...")
+    # --- CALL GEMINI 2.5 FLASH LITE ---
+    logger.info(f"🧠 Gemini 2.5 Flash Lite analyzing {len(headers)} columns...")
     
     try:
-        # Use Gemini 1.5 Flash 8B for fast, cheap inference (8B params = lighter)
+        # Use Gemini 2.5 Pro (flash-exp is deprecated, using stable pro version)
         model = genai.GenerativeModel(
-            GEMINI_MODEL,
+            'gemini-2.5-pro',
             generation_config={
                 "response_mime_type": "application/json",
                 "temperature": 0.1,  # Low temperature for consistent mapping
