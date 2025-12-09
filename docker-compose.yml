@@ -1,8 +1,48 @@
+# ==============================================================================
+# AUREON RECONCILIATION PLATFORM - DOCKER COMPOSE
+# ==============================================================================
+# Development: docker-compose up -d
+# Production: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ==============================================================================
+
 services:
+  # ---------------------------------------------------------------------------
+  # Backend API Service
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: aureon_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_URL=postgresql://aureon:aureon123@postgres:5432/custody_ai
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./backend:/app/backend:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Database
+  # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:15
+    image: postgres:15-alpine
     container_name: aureon_postgres
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: aureon
       POSTGRES_PASSWORD: aureon123
@@ -11,15 +51,37 @@ services:
       - "5435:5432"
     volumes:
       - aureon_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aureon -d custody_ai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ---------------------------------------------------------------------------
+  # Redis Cache
+  # ---------------------------------------------------------------------------
   redis:
-    image: redis:alpine
+    image: redis:7-alpine
     container_name: aureon_redis
-    restart: always
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - aureon_redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ---------------------------------------------------------------------------
+  # pgAdmin (Development Only)
+  # ---------------------------------------------------------------------------
   pgadmin:
-    image: dpage/pgadmin4
+    image: dpage/pgadmin4:latest
     container_name: aureon_pgadmin
+    restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@aureon.ai
       PGADMIN_DEFAULT_PASSWORD: admin
@@ -27,6 +89,9 @@ services:
       - "5050:80"
     depends_on:
       - postgres
+    profiles:
+      - dev-tools
 
 volumes:
   aureon_postgres_data:
+  aureon_redis_data:

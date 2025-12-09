@@ -8,7 +8,7 @@ import IngestionPanel from "../components/ingestion/IngestionPanel";
 import IngestionConsole from "../components/ingestion/IngestionConsole";
 import IngestionHistoryTable from "../components/ingestion/IngestionHistoryTable";
 
-const Ingestion = () => {
+const Ingestion = ({ onUploadComplete }) => {
   const api = useAureonApi();
   const [consoleLogs, setConsoleLogs] = useState([]);
 
@@ -42,6 +42,16 @@ const Ingestion = () => {
         response.logs.forEach(l => addLog(`> ${l}`));
       }
       
+      // Auto-navigate to dashboard after successful upload
+      if (response.status === "success" || response.status === "Completed") {
+        addLog("🔄 Redirecting to Dashboard in 2 seconds...");
+        setTimeout(() => {
+          if (onUploadComplete) {
+            onUploadComplete();
+          }
+        }, 2000);
+      }
+      
     } catch (error) {
       const errMsg = error.message || "Unknown Error";
       addLog(`❌ Upload Failed: ${errMsg}`);
@@ -59,7 +69,7 @@ const Ingestion = () => {
         </div>
         
         {/* Right Panel: Live Console Logs */}
-        <div className="col-span-9 h-full">
+        <div className="col-span-9 h-full min-h-0 overflow-hidden">
           <IngestionConsole realLogs={consoleLogs} />
         </div>
       </div>

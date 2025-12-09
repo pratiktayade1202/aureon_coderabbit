@@ -9,12 +9,14 @@ const BreakDrawer = ({ isOpen, onClose, trade, onSuccess }) => {
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
+  const [note, setNote] = useState("");
 
   // 1. Fetch Analysis on Open
   useEffect(() => {
     if (isOpen && trade) {
       setLoading(true);
       setAnalysis(null);
+      setNote("");
       
       api.getBreakAnalysis(trade.id)
         .then(data => setAnalysis(data))
@@ -28,15 +30,21 @@ const BreakDrawer = ({ isOpen, onClose, trade, onSuccess }) => {
   const handleApply = async () => {
     setIsApplying(true);
     try {
-      // Determine what note to save
-      let note = "Manual Resolve";
+      let defaultNote = "Manual Resolve";
+      let cashId = null;
       if (analysis?.found && analysis?.best_candidate) {
-        note = `Matched with Cash ID ${analysis.best_candidate.id} (${analysis.ai_suggestion.explanation})`;
+        defaultNote = `Matched with Cash ID ${analysis.best_candidate.id} (${analysis.ai_suggestion.explanation})`;
+        cashId = analysis.best_candidate.id;
       } else {
-        note = "Manual Force Resolve - No matching cash linked.";
+        defaultNote = "Manual Force Resolve - No matching cash linked.";
       }
 
-      await api.manualResolve(trade.id, note);
+      const payload = {
+        note: (note && note.trim().length > 0) ? note.trim() : defaultNote,
+        cashId,
+      };
+
+      await api.manualResolve(trade.id, payload);
       
       if (onSuccess) onSuccess();
       onClose();
@@ -168,6 +176,24 @@ const BreakDrawer = ({ isOpen, onClose, trade, onSuccess }) => {
                   </p>
                 </div>
               )}
+            </div>
+
+            {/* Note Input */}
+            <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-sm">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                  Resolution Note
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  Optional
+                </span>
+              </div>
+              <textarea
+                className="w-full h-24 text-sm font-mono border border-slate-200 rounded-md p-2 focus:outline-none focus:ring-2 focus:ring-slate-900/30 resize-none"
+                placeholder="Explain why this break was resolved or matched."
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+              />
             </div>
           </div>
 

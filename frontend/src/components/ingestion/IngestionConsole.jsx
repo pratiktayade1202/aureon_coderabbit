@@ -15,7 +15,7 @@ const IngestionConsole = ({ realLogs = [] }) => {
   }, [realLogs]);
 
   return (
-    <div className="flex flex-col bg-paper-canvas h-full p-4 border-l border-aureon-border">
+    <div className="flex flex-col bg-paper-canvas h-full min-h-0 p-4 border-l border-aureon-border overflow-hidden">
       <div className="border-b border-aureon-border pb-2 mb-3">
         <h2 className="text-[13px] font-semibold text-ink-strong uppercase tracking-wide">
           Engine Telemetry
@@ -27,7 +27,7 @@ const IngestionConsole = ({ realLogs = [] }) => {
 
       <div
         ref={consoleRef}
-        className="flex-1 bg-paper-surface border border-aureon-border rounded-md p-3 font-mono text-[11px] text-ink-strong overflow-auto shadow-inner"
+        className="flex-1 min-h-0 bg-paper-surface border border-aureon-border rounded-md p-3 font-mono text-[11px] text-ink-strong overflow-auto shadow-inner"
       >
         {realLogs.length === 0 ? (
           <p className="text-ink-muted italic opacity-50">

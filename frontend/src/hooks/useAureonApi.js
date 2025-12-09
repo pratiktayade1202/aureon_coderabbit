@@ -1,8 +1,9 @@
 // src/hooks/useAureonApi.js
 import { useAuth } from "@clerk/clerk-react";
 import { useCallback, useMemo } from "react";
+import { API_BASE_URL } from "../config";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API_BASE = API_BASE_URL;
 
 export const useAureonApi = () => {
   const { getToken } = useAuth();
@@ -49,7 +50,8 @@ export const useAureonApi = () => {
 
   return useMemo(() => ({
     // 1. DASHBOARD
-    getStats: () => request("/dashboard-stats"),
+    // Align with backend route: /api/v1/recon/dashboard-stats
+    getStats: () => request("/recon/dashboard-stats"),
     
     // 2. INGESTION (Updated Path)
     uploadIngestionFile: (formData) => request("/ingestion/upload", { 
@@ -58,8 +60,8 @@ export const useAureonApi = () => {
     }),
     
     // 3. ENGINE & RECONCILIATION
-    // Triggers the Orchestrator
-    getTrades: () => request("/recon/run", { method: "POST" }), 
+    // Fetch trades in frontend-ready format
+    getTrades: () => request("/recon/trades"),
     
     // Fetches Open Breaks
     getBreaks: () => request("/recon/breaks"),
@@ -73,15 +75,19 @@ export const useAureonApi = () => {
     
     // 5. MANUAL RESOLUTION
     // Resolves a trade via the new backend endpoint
-    manualResolve: (tradeId, reason) => request(`/recon/resolve-trade/${tradeId}`, {
+    manualResolve: (tradeId, payload = {}) => request(`/recon/resolve-trade/${tradeId}`, {
       method: "POST",
       body: JSON.stringify({
-        note: reason // Backend expects 'note' in payload
+        note: payload.note,
+        cash_id: payload.cashId ?? null,
       })
     }),
 
     // 6. SYSTEM (Updated Path)
     resetDb: () => request("/system/reset", { method: "POST" }),
+
+    // 7. TRAINING (for Learner page)
+    learnRules: () => request("/learned-rules/train", { method: "POST" }),
     
   }), [request]); 
 };

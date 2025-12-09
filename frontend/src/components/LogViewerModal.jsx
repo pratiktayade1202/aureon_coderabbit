@@ -3,8 +3,9 @@ import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, FileClock, CheckCircle, AlertTriangle, Bot } from "lucide-react";
 import { useAuth } from "@clerk/clerk-react";
+import { API_BASE_URL } from "../config";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API_BASE = API_BASE_URL;
 
 /**
  * LogViewerModal

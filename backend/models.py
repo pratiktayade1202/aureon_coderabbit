@@ -174,3 +174,22 @@ class LearningEvent(Base):
     trade_data = Column(JSON)
     correction_notes = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+# --- 4. FILE PROCESSING TRACKING ---
+
+class ProcessedFile(Base):
+    __tablename__ = "processed_files"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String, index=True)
+    filename = Column(String, nullable=False)
+    file_hash = Column(String(64), nullable=False)  # SHA256
+    file_size = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default="PENDING")  # PENDING, PROCESSING, COMPLETED, FAILED
+    processed_at = Column(DateTime, default=datetime.utcnow)
+    rows_processed = Column(Integer, default=0)
+    errors = Column(Text, nullable=True)
+    
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'file_hash', name='uq_processed_file_tenant_hash'),
+    )

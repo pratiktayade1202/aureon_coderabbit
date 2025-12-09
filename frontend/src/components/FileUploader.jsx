@@ -10,8 +10,9 @@ import {
   Loader2,
 } from "lucide-react";
 import { useAuth } from "@clerk/clerk-react";
+import { API_BASE_URL } from "../config";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API_BASE = API_BASE_URL;
 
 /**
  * FileUploader
@@ -35,9 +36,9 @@ const FileUploader = ({ onUploadSuccess }) => {
 
     try {
       const token = await getToken();
-      const res = await fetch(`${API_BASE}/upload`, {
+      const res = await fetch(`${API_BASE}/ingestion/upload`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${token || "dev-token"}` },
         body: formData,
       });
       const data = await res.json();

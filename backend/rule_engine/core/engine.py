@@ -11,6 +11,7 @@ from .aggregator import ResultAggregator
 from ..domains.positions import register_position_rules
 from ..domains.trade_cash import register_trade_cash_rules
 from ..domains.nav import register_nav_rules
+from ..domains.data_quality import register_data_quality_rules
 
 class ReconciliationEngine:
     def __init__(self):
@@ -23,6 +24,7 @@ class ReconciliationEngine:
         register_position_rules()
         register_trade_cash_rules()
         register_nav_rules()
+        register_data_quality_rules()  # NEW: Stress test detection rules
         self.is_initialized = True
         print(f"✅ Engine Ready. {len(self.registry.get_all())} rules loaded.")
 

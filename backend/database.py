@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 
 # Load the .env file
-load_dotenv()
+load_dotenv(override=True)  # Override env vars with .env file values
 
 # 1. Get the URL (Assign to DATABASE_URL)
 DATABASE_URL = os.getenv(

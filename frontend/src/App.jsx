@@ -2,7 +2,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion } from "framer-motion";
 import Ingestion from "./pages/Ingestion";
-
 import {
   Download,
   Loader2,
@@ -19,7 +18,6 @@ import {
   useAuth,
 } from "@clerk/clerk-react";
 
-import { useAureonApi } from "./hooks/useAureonApi";
 import Sidebar from "./components/Sidebar";
 import StatsGrid from "./components/StatsGrid";
 import DataTable from "./components/DataTable";
@@ -28,13 +26,14 @@ import LandingPage from "./pages/Landing";
 import LogViewerModal from "./components/LogViewerModal";
 import BreakDrawer from "./components/BreakDrawer";
 import Learner from "./pages/Learner";
+import api from "./services/aureonApi";
+import { API_BASE_URL } from "./config";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const API_BASE = API_BASE_URL;
 
 function App() {
   const { signOut } = useClerk();
   const { getToken } = useAuth();
-  const api = useAureonApi();
 
   const [showSignIn, setShowSignIn] = useState(false);
   const [activeTab, setActiveTab] = useState("Dashboard");
@@ -42,6 +41,7 @@ function App() {
 
   const [stats, setStats] = useState({ total_assets: 0, pending_settlements: 0 });
   const [reconData, setReconData] = useState([]);
+  const [tradePagination, setTradePagination] = useState(null);
   const [holdingsData, setHoldingsData] = useState([]);
   const [navData, setNavData] = useState([]);
 
@@ -60,30 +60,89 @@ function App() {
   // -----------------------------
   const fetchStats = useCallback(async () => {
     try {
-      const data = await api.getStats();
-      if (data) setStats(data);
-    } catch (e) { console.error(e); }
-  }, [api]);
+      const token = await getToken();
+      const data = await api.getStats(token);
+      if (data) {
+        // Map backend response to frontend format
+        // AUC (Assets Under Custody) priority:
+        // 1. holdings.total_auc - actual custody value
+        // 2. summary.auc - pre-computed value
+        // 3. trades.total_amount - fallback to trade volume
+        let auc = data.holdings?.total_auc || 0;
+        if (auc === 0) {
+          auc = data.summary?.auc || data.trades?.total_amount || 0;
+        }
+        
+        // Pending settlements = unsettled trades + open breaks
+        const pending = (data.trades?.unsettled || 0) + (data.breaks?.open || 0);
+        
+        setStats({
+          total_assets: auc,
+          pending_settlements: pending,
+          // Include all backend data for reference
+          holdings: data.holdings,
+          nav: data.nav,
+          trades: data.trades,
+          cash: data.cash,
+          breaks: data.breaks,
+          reconciliation: data.reconciliation,
+          summary: data.summary,
+        });
+      }
+    } catch (e) { 
+      console.error("Failed to fetch stats:", e); 
+    }
+  }, [getToken]);
+
+  // Full data refresh function
+  const refreshAllData = useCallback(async () => {
+    try {
+      const token = await getToken();
+      
+      // Fetch stats
+      fetchStats();
+      
+      // Fetch trades
+      const { rows, pagination } = await api.getTrades(token);
+      setReconData(rows);
+      setTradePagination(pagination);
+      checkBreaks(rows);
+      
+      // Fetch holdings
+      const holdingsRes = await api.runPositionRecon(token);
+      setHoldingsData(Array.isArray(holdingsRes) ? holdingsRes : []);
+      
+      // Fetch NAV
+      const navRes = await fetch(`${API_BASE}/recon/nav`, {
+        headers: { Authorization: `Bearer ${token || "dev-token"}` }
+      });
+      if (navRes.ok) {
+        const navData = await navRes.json();
+        setNavData(Array.isArray(navData) ? navData : []);
+      }
+    } catch (e) {
+      console.error("Failed to refresh data:", e);
+    }
+  }, [getToken, fetchStats]);
 
   // Initial Load Logic
   useEffect(() => {
     if (activeTab === "Dashboard" && !hasFetched.current) {
       hasFetched.current = true;
-      fetchStats();
-      if (dataView === "Trades") {
-        api.getTrades().then(data => {
-           const rows = Array.isArray(data) ? data : [];
-           setReconData(rows);
-           checkBreaks(rows);
-        }).catch(() => {});
-      }
+      refreshAllData();
     }
-  }, [activeTab, fetchStats, api, dataView]);
+  }, [activeTab, refreshAllData]);
 
   const checkBreaks = (rows) => {
-    const foundBreaks = rows.some((row) =>
-      (row.status || "").toLowerCase().includes("break")
-    );
+    const foundBreaks = rows.some((row) => {
+      const status = row.status;
+      // Handle both old string format and new object format
+      if (typeof status === "object" && status !== null) {
+        return status.status === "BREAK" || status.status === "UNSETTLED";
+      }
+      const statusStr = (status || "").toLowerCase();
+      return statusStr.includes("break") || statusStr.includes("unsettled");
+    });
     setHasBreaks(foundBreaks);
   };
 
@@ -93,13 +152,17 @@ function App() {
   const runSettlementEngine = async () => {
     setIsProcessing(true);
     try {
+      const token = await getToken();
       if (dataView === "Trades") {
-        const data = await api.getTrades(); // Trigger Engine
-        const rows = Array.isArray(data) ? data : [];
+        // Run reconciliation first
+        await api.runReconciliation(token);
+        // Then fetch updated trades
+        const { rows, pagination } = await api.getTrades(token);
         setReconData(rows);
+        setTradePagination(pagination);
         checkBreaks(rows); // Update button state immediately
       } else if (dataView === "Holdings") {
-        const data = await api.runPositionRecon();
+        const data = await api.runPositionRecon(token);
         const rows = Array.isArray(data) ? data : [];
         setHoldingsData(rows);
         setHasBreaks(false);
@@ -118,11 +181,13 @@ function App() {
   const runAiResolve = async () => {
     setIsProcessing(true);
     try {
-      const result = await api.runAiResolve();
+      const token = await getToken();
+      const result = await api.runAiResolve(token);
       // Refresh list to show "SETTLED (AI)"
-      const data = await api.getTrades(); 
-      setReconData(Array.isArray(data) ? data : []);
-      setHasBreaks(false); // Reset button since we just resolved them
+      const { rows, pagination } = await api.getTrades(token); 
+      setReconData(rows);
+      setTradePagination(pagination);
+      checkBreaks(rows);
       await fetchStats();
       
       if (result?.resolved > 0) alert(`AI Successfully Resolved ${result.resolved} breaks.`);
@@ -136,23 +201,39 @@ function App() {
   };
 
   const resetDatabase = async () => {
-    if(!window.confirm("Confirm reset?")) return;
+    if(!window.confirm("Confirm reset? This will delete all data for your tenant.")) return;
     try {
-      await api.resetDb();
+      const token = await getToken();
+      await api.resetDb(token);
       window.location.reload();
-    } catch (e) { alert("Reset failed"); }
+    } catch (e) { 
+      alert("Reset failed: " + e.message); 
+    }
   };
 
   const handleExport = async () => {
     try {
       const token = await getToken();
-      const res = await fetch(`${API_BASE}/export-data`, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch(`${API_BASE}/recon/export-data`, { 
+        headers: { Authorization: `Bearer ${token}` } 
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        alert(data.message || "Export not yet implemented");
+        return;
+      }
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url; a.download = "aureon_export.csv";
-      document.body.appendChild(a); a.click(); a.remove();
-    } catch (e) { alert("Export failed"); }
+      a.href = url; 
+      a.download = "aureon_export.csv";
+      document.body.appendChild(a); 
+      a.click(); 
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e) { 
+      alert("Export failed: " + e.message); 
+    }
   };
 
   return (

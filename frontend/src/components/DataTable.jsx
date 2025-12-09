@@ -35,7 +35,14 @@ const formatNumber = (val) => {
 
 // Status badge with hard color semantics
 const StatusCell = ({ value }) => {
-  const status = (value || "UNSETTLED").toUpperCase();
+  // Handle both string format and object format from backend
+  let statusStr = "UNSETTLED";
+  if (typeof value === "object" && value !== null) {
+    statusStr = value.status || "UNSETTLED";
+  } else if (typeof value === "string") {
+    statusStr = value;
+  }
+  const status = statusStr.toUpperCase();
 
   if (
     status.includes("SETTLED") ||
@@ -169,7 +176,10 @@ const DataTable = ({ view, reconData, holdingsData, navData, onResolve }) => {
           header: "",
           enableSorting: false,
           cell: ({ row }) => {
-            const status = (row.original.status || "").toLowerCase();
+            const statusObj = row.original.status || {};
+            const status = typeof statusObj === "object" && statusObj !== null
+              ? (statusObj.status || "").toLowerCase()
+              : (statusObj || "").toLowerCase();
             const resolved =
               status.includes("settled") || status.includes("match");
             if (resolved) return null;

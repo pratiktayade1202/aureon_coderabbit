@@ -1,116 +1,135 @@
-// frontend/src/services/aureonApi.js
+// src/services/aureonApi.js
+import { API_BASE_URL } from '../config';
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const request = async (path, options = {}) => {
+  const { token, method = "GET", body } = options;
+  const headers = {
+    "Content-Type": "application/json",
+    ...(token && { Authorization: `Bearer ${token}` }),
+  };
 
-/**
- * Generic request helper with Auth and Error handling
- */
-async function request(path, { method = "GET", token, body, isFormData = false } = {}) {
-  const headers = {};
-
-  if (!isFormData) {
-    headers["Content-Type"] = "application/json";
-  }
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`;
-  }
-
-  const res = await fetch(`${API_BASE}${path}`, {
+  const config = {
     method,
     headers,
-    body: isFormData ? body : body ? JSON.stringify(body) : undefined,
-  });
+    ...(body && { body: JSON.stringify(body) }),
+  };
 
+  const url = `${API_BASE_URL}${path}`;
+  console.log(`[API] ${method} ${url}`);
+
+  const res = await fetch(url, config);
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API ${method} ${path} failed: ${res.status} ${text}`);
+    const errorText = await res.text();
+    throw new Error(`API error ${res.status}: ${errorText}`);
   }
+  return await res.json();
+};
 
-  return res.json();
-}
+// --- REAL ENDPOINTS ---
 
-// ==========================================
-// 1. INGESTION (Synchronous)
-// ==========================================
+export const getDashboardStats = (token) => request("/recon/dashboard-stats", { token });
 
-export async function uploadIngestionFile(file, token) {
-  const form = new FormData();
-  form.append("file", file);
+export const runReconciliation = (token) => request("/recon/run", { method: "POST", token });
 
-  // We now use the sync endpoint. No need to poll for job IDs anymore.
-  return request("/ingestion/upload", {
+export const getRules = (token) => request("/rules/list", { token });
+
+export const getUploadHistory = (token) => request("/ingestion/upload/history", { token });
+
+export const uploadFile = (formData) => {
+  return fetch(`${API_BASE_URL}/ingestion/upload`, {
     method: "POST",
-    token,
-    body: form,
-    isFormData: true,
+    headers: {
+      Authorization: "Bearer dev-token",
+    },
+    body: formData,
+  }).then(res => {
+    if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+    return res.json();
   });
-}
+};
 
-// ==========================================
-// 2. RECONCILIATION ENGINE
-// ==========================================
+// --- COMPATIBILITY LAYER FOR App.jsx ---
 
-export async function runReconciliation(token) {
-  // Triggers the Python Rule Engine
-  return request("/recon/run", { method: "POST", token });
-}
+// Alias getStats to getDashboardStats
+export const getStats = getDashboardStats;
 
-export async function getBreaks(token) {
-  return request("/recon/breaks", { token });
-}
+// Get trades - calls real backend endpoint
+export const getTrades = async (token, params = {}) => {
+  try {
+    const search = new URLSearchParams();
+    if (params.page) search.set("page", params.page);
+    if (params.pageSize) search.set("page_size", params.pageSize);
+    if (params.status) search.set("status", params.status);
+    if (params.symbol) search.set("symbol", params.symbol);
+    if (params.dateFrom) search.set("date_from", params.dateFrom);
+    if (params.dateTo) search.set("date_to", params.dateTo);
 
-export async function clearBreak(breakId, token) {
-  // Manually resolves a break and logs a Learning Event
-  return request(`/recon/clear/${breakId}`, { method: "POST", token });
-}
+    const query = search.toString();
+    const response = await request(
+      `/recon/trades${query ? `?${query}` : ""}`,
+      { token }
+    );
 
-// ==========================================
-// 3. AI & ANALYSIS
-// ==========================================
+    if (Array.isArray(response)) {
+      return { rows: response, pagination: null };
+    }
 
-export async function getBreakAnalysis(tradeId, token) {
-  // Calls the Co-Pilot to analyze a specific trade/break
-  return request(`/analyze-break/${tradeId}`, { token });
-}
+    return {
+      rows: response?.data || [],
+      pagination: response?.pagination || null,
+      status: response?.status || "success",
+    };
+  } catch (error) {
+    console.error("Failed to fetch trades:", error);
+    return { rows: [], pagination: null, status: "error" };
+  }
+};
 
-export async function getLearnedRules(token) {
-  // Fetches patterns learned by the AI Agent
-  return request("/learned-rules", { token });
-}
+// Run position reconciliation
+export const runPositionRecon = async (token) => {
+  try {
+    const data = await request("/recon/position-recon", { method: "POST", token });
+    return Array.isArray(data) ? data : [];
+  } catch (error) {
+    console.error("Failed to run position recon:", error);
+    return [];
+  }
+};
 
-// ==========================================
-// 4. DASHBOARD & SYSTEM
-// ==========================================
+// Run AI resolve
+export const runAiResolve = async (token) => {
+  try {
+    const data = await request("/recon/ai-resolve", { method: "POST", token });
+    return data;
+  } catch (error) {
+    console.error("Failed to run AI resolve:", error);
+    throw error;
+  }
+};
 
-export async function getDashboardStats(token) {
-  return request("/dashboard-stats", { token });
-}
+// Reset database
+export const resetDb = async (token) => {
+  try {
+    const data = await request("/recon/reset-db", { method: "POST", token });
+    return data;
+  } catch (error) {
+    console.error("Failed to reset database:", error);
+    throw error;
+  }
+};
 
-export async function resetDatabase(token) {
-  // The "Nuclear Option" - Wipes DB and resets memory
-  return request("/reset-db", { method: "POST", token });
-}
+// Default export object for backward compatibility with App.jsx imports
+const api = {
+  getStats,
+  getTrades,
+  getDashboardStats,
+  runReconciliation,
+  getRules,
+  uploadFile,
+  getUploadHistory,
+  runPositionRecon,
+  runAiResolve,
+  resetDb,
+};
 
-// ==========================================
-// 5. RULE MANAGEMENT (Legacy/Optional)
-// ==========================================
-
-export async function listRules(token) {
-  return request("/rules/list", { token });
-}
-
-export async function activateRule(ruleId, token) {
-  return request(`/rules/activate/${ruleId}`, { method: "POST", token });
-}
-
-export async function deactivateRule(ruleId, token) {
-  return request(`/rules/deactivate/${ruleId}`, { method: "POST", token });
-}
-
-export async function createRule(rule, token) {
-  return request("/rules/create", {
-    method: "POST",
-    token,
-    body: rule,
-  });
-}
+export default api;
