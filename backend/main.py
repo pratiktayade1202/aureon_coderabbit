@@ -28,6 +28,7 @@ from .recon_api import router as recon_router
 from .rules_api import router as rules_router
 from .learning_api import router as learning_router
 from .health import router as health_router
+from .seed_rules import ensure_rule_definitions_exist
 
 # Initialize logging
 logger = setup_logging(settings.environment)
@@ -50,6 +51,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {str(e)}")
         raise
+    
+    # Seed rule definitions
+    logger.info("🌱 Seeding rule definitions...")
+    try:
+        ensure_rule_definitions_exist()
+    except Exception as e:
+        logger.error(f"❌ Rule seeding failed: {str(e)}")
+        # Don't crash the app, but log the error
+        # Rules can be seeded later or on next restart
     
     yield  # Application runs here
     

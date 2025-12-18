@@ -5,7 +5,7 @@ Uses pydantic-settings for environment variable validation and type safety.
 """
 import sys
 import logging
-from typing import List
+from typing import List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
@@ -35,12 +35,15 @@ class Settings(BaseSettings):
     # === Redis Configuration (REQUIRED) ===
     redis_url: str = Field(..., alias="REDIS_URL")
     
-    # === AI Services - API Keys (REQUIRED) ===
+    # === AI Services - API Keys ===
+    # Gemini is REQUIRED (Primary)
     gemini_api_key: str = Field(..., alias="GEMINI_API_KEY")
-    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
+    
+    # OpenAI is OPTIONAL (Fallback only)
+    openai_api_key: Optional[str] = Field(default=None, alias="OPENAI_API_KEY")
     
     # === AI Model Configuration (with defaults) ===
-    gemini_model: str = Field(default="gemini-2.5-pro", alias="GEMINI_MODEL")
+    gemini_model: str = Field(default="gemini-2.0-flash-exp", alias="GEMINI_MODEL")
     openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
     
     # === CORS Configuration ===
@@ -69,17 +72,14 @@ class Settings(BaseSettings):
             return ["*"]
         return [origin.strip() for origin in self.cors_origins_str.split(",")]
     
-    @field_validator("gemini_api_key", "openai_api_key")
+    @field_validator("gemini_api_key")
     @classmethod
-    def validate_api_keys(cls, v: str) -> str:
-        """Validate that API keys are not empty and have reasonable length."""
+    def validate_gemini_key(cls, v: str) -> str:
+        """Validate Gemini key is present."""
         if not v or len(v) < 10:
-            raise ValueError(
-                "API key is required and must be a valid key. "
-                "Please set GEMINI_API_KEY and OPENAI_API_KEY in your .env file."
-            )
+            raise ValueError("GEMINI_API_KEY is required.")
         return v
-    
+        
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, v: str) -> str:
@@ -106,23 +106,18 @@ class Settings(BaseSettings):
 def _initialize_settings() -> Settings:
     """
     Initialize settings with fail-fast behavior.
-    
-    If required environment variables are missing or invalid,
-    log a clear error and exit the process immediately.
-    
-    Returns:
-        Settings: Validated settings instance
-        
-    Exits:
-        Calls sys.exit(1) if validation fails
     """
     try:
         settings = Settings()
         logger.info(f"✓ Configuration loaded successfully for environment: {settings.environment}")
         logger.info(f"✓ Database: {settings.database_url.split('@')[-1] if '@' in settings.database_url else 'configured'}")
-        logger.info(f"✓ Redis: {settings.redis_url.split('@')[-1] if '@' in settings.redis_url else 'configured'}")
-        logger.info(f"✓ Gemini Model: {settings.gemini_model}")
-        logger.info(f"✓ OpenAI Model: {settings.openai_model}")
+        logger.info(f"✓ Gemini Model: {settings.gemini_model} (PRIMARY)")
+        
+        if settings.openai_api_key:
+            logger.info(f"✓ OpenAI Model: {settings.openai_model} (FALLBACK ENABLED)")
+        else:
+            logger.info("ℹ OpenAI: Disabled (No API Key provided)")
+            
         return settings
     except Exception as e:
         logger.critical("=" * 80)
@@ -131,12 +126,9 @@ def _initialize_settings() -> Settings:
         logger.critical(str(e))
         logger.critical("")
         logger.critical("Required environment variables:")
-        logger.critical("  - DATABASE_URL: PostgreSQL connection string")
-        logger.critical("  - REDIS_URL: Redis connection string")
-        logger.critical("  - GEMINI_API_KEY: Google AI API key")
-        logger.critical("  - OPENAI_API_KEY: OpenAI API key")
-        logger.critical("")
-        logger.critical("Please ensure all required variables are set in your .env file")
+        logger.critical("  - DATABASE_URL")
+        logger.critical("  - REDIS_URL")
+        logger.critical("  - GEMINI_API_KEY")
         logger.critical("=" * 80)
         sys.exit(1)
 

@@ -19,6 +19,7 @@ from backend.models import (
     RuleDefinition,
     ReconBreak,
     ReconLog,
+    ReconProposal,
     RuleMemory,
     LearningEvent,
 )

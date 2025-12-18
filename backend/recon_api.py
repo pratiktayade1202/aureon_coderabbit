@@ -2,23 +2,71 @@
 """
 Reconciliation API endpoints with proper error handling and transaction safety.
 """
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, case
 from typing import Dict, Any, List, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from contextlib import contextmanager
 import logging
+import csv
+import io
 
 from .auth import get_current_user
 from .database import get_db
 from .rule_engine.orchestrator import ReconOrchestrator
-from .models import BrokerTrade, BankTxn, Holding, ReconBreak, ReconStatus, NavLog, ReconLog, LearningEvent
+from .models import BrokerTrade, BankTxn, Holding, ReconBreak, ReconStatus, NavLog, ReconLog, LearningEvent, ReconProposal, ReconLock
 from .ai_layer.agent import AIAgent
 from .utils.financial import to_decimal
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 router = APIRouter(tags=["reconciliation"])
 logger = logging.getLogger(__name__)
+
+
+# --- TENANT ISOLATION: MUTEX LOCK HELPER ---
+@contextmanager
+def acquire_tenant_lock(db: Session, user_id: str, process_name: str, timeout_seconds: int = 300):
+    """
+    Context manager to enforce single-threaded execution per tenant.
+    Raises 409 if locked. Releases lock on exit.
+    
+    PHASE 3: TENANT ISOLATION (The Traffic Cop)
+    Prevents concurrent heavy operations (upload, settlement, AI resolve, commit).
+    """
+    now = datetime.utcnow()
+    
+    # 1. Check existing lock
+    lock = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+    
+    if lock and lock.locked_until > now:
+        remaining = int((lock.locked_until - now).total_seconds())
+        raise HTTPException(
+            status_code=409, 
+            detail=f"System is busy processing '{lock.process_name}'. Please wait {remaining} seconds."
+        )
+    
+    # 2. Acquire Lock
+    expiry = now + timedelta(seconds=timeout_seconds)
+    if not lock:
+        lock = ReconLock(tenant_id=user_id, locked_until=expiry, process_name=process_name)
+        db.add(lock)
+    else:
+        lock.locked_until = expiry
+        lock.process_name = process_name
+    
+    db.commit()
+    
+    try:
+        yield  # Allow endpoint to run
+    finally:
+        # 3. Release Lock (by expiring it immediately)
+        # We fetch again to be safe in case of session weirdness, though usually object is attached
+        lock = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+        if lock:
+            lock.locked_until = datetime.utcnow()  # Expire it
+            db.commit()
 
 
 class ManualResolveRequest(BaseModel):
@@ -26,8 +74,18 @@ class ManualResolveRequest(BaseModel):
     note: Optional[str] = None
 
 
+class BulkResolveRequest(BaseModel):
+    trade_ids: List[int]
+    note: Optional[str] = "Bulk Manual Resolve"
+
+
+class CommitProposalsRequest(BaseModel):
+    min_confidence: Optional[float] = None
+
+
 def _reset_tenant_data(db: Session, user_id: str) -> None:
     """Utility: wipes all tenant data. Used by both reset endpoints."""
+    db.execute(text("DELETE FROM recon_proposals WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM recon_breaks WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM recon_logs WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM bank_txns WHERE tenant_id = :tid"), {"tid": user_id})
@@ -35,36 +93,219 @@ def _reset_tenant_data(db: Session, user_id: str) -> None:
     db.execute(text("DELETE FROM broker_trades WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM processed_files WHERE tenant_id = :tid"), {"tid": user_id})
 
-@router.post("/run") 
-def run_reconciliation_process(
+@router.post("/run-settlement-engine")
+def run_settlement_engine(
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    Run trade reconciliation process.
+    PHASE 2: RUN SETTLEMENT ENGINE (Deterministic Rules Only)
+    
+    This endpoint performs ONLY deterministic rule-based reconciliation:
+    1. Runs trade-cash matching rules (amount, date, currency matching)
+    2. Updates settlement statuses (UNSETTLED → MATCHED)
+    3. Creates reconciliation breaks for unmatched trades
+    4. Updates holdings and AUC based on matched trades
+    5. Sets resolution_type = "RULE" for deterministically matched trades
+    6. Writes audit events for all rule-based actions
+    
+    CRITICAL: This does NOT invoke AI/GPT.
+    
+    After this phase:
+    - Dashboard shows reduced pending settlements
+    - Resolved trades have resolution_type = "RULE"
+    - Remaining breaks are visible
+    - Holdings and AUC are updated
+    - Button changes to "AUTO RESOLVE" for AI phase
     """
-    try:
-        orchestrator = ReconOrchestrator(db, user_id)
-        result = orchestrator.run_trade_recon()
-        
-        return {
-            "status": "success",
-            "message": "Reconciliation completed successfully",
-            "run_id": orchestrator.run_id,
-            "tenant_id": user_id,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "matches": result.get("matches", 0),
-            "breaks": result.get("breaks", 0),
-            "details": result
-        }
-        
-    except Exception as e:
-        logger.error(f"Reconciliation failed: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Reconciliation failed: {str(e)}"
-        )
+    with acquire_tenant_lock(db, user_id, "Settlement Engine"):
+        try:
+            logger.info(f"SETTLEMENT ENGINE (Phase 2) triggered for tenant {user_id}")
+            
+            # Run ONLY deterministic rule engine (no AI)
+            orchestrator = ReconOrchestrator(db, user_id)
+            result = orchestrator.run_trade_recon()
+            
+            matches = result.get("matches", 0)
+            breaks_created = result.get("breaks", 0)
+            
+            logger.info(f"Deterministic rules completed: {matches} matches, {breaks_created} breaks created")
+            
+            return {
+                "status": "success",
+                "message": "Settlement engine completed - deterministic rules applied",
+                "phase": "PHASE_2_DETERMINISTIC",
+                "run_id": orchestrator.run_id,
+                "tenant_id": user_id,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "deterministic_results": {
+                    "matches": matches,
+                    "breaks_created": breaks_created,
+                    "resolution_type": "RULE"
+                },
+                "next_step": "Click AUTO RESOLVE to apply AI reasoning to remaining breaks",
+                "details": result
+            }
+                
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Settlement engine failed: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Settlement engine failed: {str(e)}"
+            )
+
+
+@router.post("/auto-resolve")
+def run_auto_resolve(
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    PHASE 3: AUTO RESOLVE (AI/GPT Only)
+    
+    This endpoint performs ONLY AI-based resolution of remaining breaks:
+    1. Analyzes all open breaks using GPT/AI reasoning
+    2. For high-confidence AI matches (≥ 0.85):
+       - Resolves the break
+       - Updates trade status to MATCHED
+       - Sets resolution_type = "AI"
+       - Sets resolution_note = <GPT explanation>
+    3. Updates holdings and AUC for AI-resolved trades
+    4. Writes audit logs for all AI decisions
+    
+    CRITICAL: This does NOT run deterministic rules.
+    You must run "RUN SETTLEMENT ENGINE" first.
+    
+    After this phase:
+    - Dashboard shows fully reconciled trades
+    - AI-resolved trades have resolution_type = "AI" and explanation
+    - Holdings and AUC are finalized
+    - Complete audit trail is visible
+    """
+    with acquire_tenant_lock(db, user_id, "AI Auto-Resolve"):
+        try:
+            logger.info(f"AUTO RESOLVE (Phase 3 - AI Only) triggered for tenant {user_id}")
+            
+            # PHASE 3 (AIR GAP): AI creates proposals only. No ledger mutation here.
+            proposals_created = 0
+            propose_threshold = 0.80  # Create proposals at/above this confidence
+            
+            # Get all open breaks (remaining after Phase 2)
+            open_breaks = db.query(ReconBreak).filter(
+                ReconBreak.tenant_id == user_id,
+                ReconBreak.status == "OPEN"
+            ).all()
+            
+            if not open_breaks:
+                logger.info(f"No open breaks to resolve - settlement engine already resolved everything")
+                return {
+                    "status": "success",
+                    "message": "No open breaks remaining - nothing to propose",
+                    "phase": "PHASE_3_AI_PROPOSAL",
+                    "tenant_id": user_id,
+                    "ai_results": {
+                        "breaks_analyzed": 0,
+                        "proposals_created": 0,
+                        "threshold": propose_threshold
+                    }
+                }
+            
+            logger.info(f"AI phase: Analyzing {len(open_breaks)} remaining breaks after settlement engine")
+            
+            try:
+                agent = AIAgent(db, user_id)
+
+                for brk in open_breaks:
+                    if not brk.trade_id:
+                        continue
+
+                    analysis = agent.analyze_single_trade(brk.trade_id)
+                    confidence = analysis.get("ai_suggestion", {}).get("confidence", 0) or 0.0
+
+                    # CHECK: Is confidence high enough to PROPOSE?
+                    if analysis.get("found") and confidence >= propose_threshold:
+                        best_candidate = analysis.get("best_candidate")
+                        explanation = analysis.get("ai_suggestion", {}).get("explanation", "") or ""
+
+                        if best_candidate and best_candidate.get("id"):
+                            # Avoid duplicate pending proposals for the same break
+                            existing = (
+                                db.query(ReconProposal)
+                                .filter(
+                                    ReconProposal.tenant_id == user_id,
+                                    ReconProposal.status == "PENDING",
+                                    ReconProposal.break_id == brk.id,
+                                )
+                                .first()
+                            )
+                            if existing:
+                                continue
+
+                            proposal = ReconProposal(
+                                tenant_id=user_id,
+                                trade_id=brk.trade_id,
+                                cash_id=best_candidate.get("id"),
+                                break_id=brk.id,
+                                confidence=float(confidence),
+                                explanation=explanation[:500],
+                                source_model="AI_AGENT",
+                                status="PENDING",
+                            )
+                            db.add(proposal)
+                            proposals_created += 1
+
+                db.commit()
+                logger.info(f"AI proposal generation complete: {proposals_created} proposals created")
+
+            except Exception as ai_error:
+                logger.error(f"AI phase failed: {str(ai_error)}", exc_info=True)
+                db.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI proposal generation failed: {str(ai_error)}"
+                )
+            
+            return {
+                "status": "success",
+                "message": f"AI generated {proposals_created} proposals for review.",
+                "phase": "PHASE_3_AI_PROPOSAL",
+                "tenant_id": user_id,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "ai_results": {
+                    "breaks_analyzed": len(open_breaks),
+                    "resolved": 0,  # air-gap: nothing committed here
+                    "proposals_created": proposals_created,
+                    "threshold": propose_threshold,
+                    "resolution_type": "AI_PROPOSAL"
+                },
+                "proposals_count": proposals_created
+            }
+                
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Auto Resolve failed: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Auto Resolve failed: {str(e)}"
+            )
+
+@router.post("/run")
+def run_reconciliation_process_legacy(
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    LEGACY ENDPOINT: Redirects to /run-settlement-engine (Phase 2).
+    Kept for backward compatibility with existing frontend code.
+    
+    This runs ONLY deterministic rules (not AI).
+    For AI resolution, call /auto-resolve after this completes.
+    """
+    return run_settlement_engine(background_tasks, user_id, db)
 
 def _get_resolution_type(bank_ref: str) -> str:
     """
@@ -108,6 +349,16 @@ def get_trades(
     """
     Get trades for the tenant with pagination and filtering.
     
+    **PHASE SEPARATION - READ-ONLY ENDPOINT:**
+    - Before Auto Resolve: All trades show UNSETTLED (raw ingested state)
+      - No resolution_type or resolution_note
+      - No reconciliation breaks visible
+    - After Auto Resolve: Trades show reconciliation status
+      - MATCHED trades have resolution_type (RULE/MANUAL/AI) and resolution_note
+      - UNSETTLED trades may have BREAK status if couldn't be matched
+    
+    This endpoint does NOT trigger any reconciliation logic.
+    
     Args:
         page: Page number (1-indexed)
         page_size: Number of items per page (max 100)
@@ -118,8 +369,8 @@ def get_trades(
     
     Returns:
         Paginated response with trades and metadata including:
-        - resolution_type: How the trade was resolved (RULE/MANUAL/AI/UNKNOWN)
-        - resolution_note: Additional context about the resolution
+        - resolution_type: How the trade was resolved (RULE/MANUAL/AI) - only for MATCHED
+        - resolution_note: Additional context about the resolution - only for MATCHED
     """
     try:
         # Validate pagination params
@@ -132,7 +383,22 @@ def get_trades(
         
         # Apply filters
         if status:
-            query = query.filter(BrokerTrade.status == status.upper())
+            status_upper = status.upper()
+            # Special-case BREAK: it's derived from UNSETTLED + open ReconBreak, not stored on BrokerTrade.status
+            if status_upper == "BREAK":
+                query = query.filter(
+                    (BrokerTrade.status == "UNSETTLED") | (BrokerTrade.status.is_(None))
+                ).filter(
+                    db.query(ReconBreak.id)
+                    .filter(
+                        ReconBreak.trade_id == BrokerTrade.id,
+                        ReconBreak.tenant_id == user_id,
+                        ReconBreak.status == "OPEN",
+                    )
+                    .exists()
+                )
+            else:
+                query = query.filter(BrokerTrade.status == status_upper)
         
         if symbol:
             query = query.filter(BrokerTrade.symbol.ilike(f"%{symbol}%"))
@@ -163,34 +429,33 @@ def get_trades(
         formatted_trades = []
         
         for t in trades:
-            # Determine display status with full context
+            # CRITICAL FIX:
+            # Frontend expects `status` to be a string (React cannot render objects as children).
+            # Extra structured info is emitted via `break_details`.
+            status_str = t.status
+            break_details = None
+            resolution_type = None
+
             if t.status == "MATCHED":
+                status_str = "MATCHED"
                 resolution_type = _get_resolution_type(t.bank_ref)
-                display_status = {
-                    "status": "MATCHED",
-                    "resolution_type": resolution_type,
-                }
             elif t.status == "UNSETTLED" or t.status is None:
-                # Check for open breaks
-                has_break = db.query(ReconBreak).filter_by(
-                    trade_id=t.id, 
-                    status="OPEN"
-                ).first()
+                has_break = db.query(ReconBreak).filter_by(trade_id=t.id, status="OPEN").first()
                 if has_break:
-                    display_status = {
-                        "status": "BREAK",
+                    status_str = "BREAK"
+                    break_details = {
                         "break_type": has_break.break_type,
                         "severity": has_break.severity.value if has_break.severity else "MEDIUM",
                         "break_id": has_break.id,
                     }
                 else:
-                    display_status = {"status": "UNSETTLED"}
+                    status_str = "UNSETTLED"
             else:
-                display_status = {"status": t.status}
+                status_str = t.status or "UNSETTLED"
             
-            # Extract resolution note (content after the prefix)
+            # Extract resolution note (only for MATCHED trades - phase separation)
             resolution_note = None
-            if t.bank_ref:
+            if t.status == "MATCHED" and t.bank_ref:
                 if ":" in t.bank_ref:
                     resolution_note = t.bank_ref.split(":", 1)[1].strip()
                 else:
@@ -204,10 +469,11 @@ def get_trades(
                 "quantity": float(to_decimal(t.quantity)),
                 "price": float(to_decimal(t.price)),
                 "amount": float(to_decimal(t.amount)),
-                "status": display_status,
-                "resolution_type": display_status.get("resolution_type") if isinstance(display_status, dict) else None,
+                "status": status_str,  # <-- always a string (prevents React crash)
+                "break_details": break_details,  # <-- structured details for UI
+                "resolution_type": resolution_type,
                 "resolution_note": resolution_note,
-                "bank_ref": t.bank_ref,
+                "bank_ref": t.bank_ref if t.status == "MATCHED" else None,  # Only expose after reconciliation
                 "currency": t.currency or "INR",
                 "source_file": t.source_file,
             })
@@ -280,6 +546,155 @@ def analyze_trade_break(
     analysis["trade_id"] = trade_id
     return analysis
 
+@router.get("/workflow-status")
+def get_workflow_status(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    Get current workflow phase and which button to show.
+    
+    This is a lightweight endpoint for the frontend to determine
+    which reconciliation button to display.
+    
+    Returns:
+    - current_phase: PHASE_1_INGESTION, PHASE_2_SETTLEMENT_COMPLETE, or PHASE_3_COMPLETE
+    - button_to_show: RUN_SETTLEMENT_ENGINE, AUTO_RESOLVE, or null
+    - next_action: Human-readable description
+    """
+    try:
+        # Count RULE-based matches (Phase 2 indicator)
+        rule_matches = db.execute(
+            text("""
+                SELECT COUNT(*) FROM broker_trades 
+                WHERE tenant_id = :tid 
+                AND status = 'MATCHED' 
+                AND bank_ref LIKE 'RULE:%'
+            """),
+            {"tid": user_id}
+        ).scalar() or 0
+        
+        # Count AI-based matches (Phase 3 indicator)
+        # Air-gap mode commits use AI_COMMIT; keep legacy AI:% too.
+        ai_matches = db.execute(
+            text("""
+                SELECT COUNT(*) FROM broker_trades 
+                WHERE tenant_id = :tid 
+                AND status = 'MATCHED' 
+                AND (bank_ref LIKE 'AI_COMMIT:%' OR bank_ref LIKE 'AI:%')
+            """),
+            {"tid": user_id}
+        ).scalar() or 0
+        
+        # Count total trades
+        total_trades = db.execute(
+            text("SELECT COUNT(*) FROM broker_trades WHERE tenant_id = :tid"),
+            {"tid": user_id}
+        ).scalar() or 0
+        
+        # Count unsettled trades
+        unsettled_trades = db.execute(
+            text("""
+                SELECT COUNT(*) FROM broker_trades 
+                WHERE tenant_id = :tid 
+                AND (status = 'UNSETTLED' OR status IS NULL)
+            """),
+            {"tid": user_id}
+        ).scalar() or 0
+        
+        # Count open breaks
+        open_breaks = db.execute(
+            text("""
+                SELECT COUNT(*) FROM recon_breaks 
+                WHERE tenant_id = :tid 
+                AND status = 'OPEN'
+            """),
+            {"tid": user_id}
+        ).scalar() or 0
+
+        # NEW: Count pending AI proposals (Air Gap workflow)
+        pending_proposals = (
+            db.query(ReconProposal)
+            .filter(
+                ReconProposal.tenant_id == user_id,
+                ReconProposal.status == "PENDING",
+            )
+            .count()
+        )
+
+        # CRITICAL FIX:
+        # The settlement engine "ran" if it produced rule matches OR it produced breaks.
+        # A stress test can easily yield 0 matches but many breaks — we must still
+        # unlock Phase 2 (AUTO_RESOLVE) in that case.
+        settlement_ran = (rule_matches > 0) or (open_breaks > 0)
+        
+        # Determine phase and button
+        if total_trades == 0:
+            phase = "PHASE_0_NO_DATA"
+            button = None
+            action = "Upload files to begin reconciliation"
+            can_run_settlement = False
+            can_run_ai = False
+        elif pending_proposals > 0:
+            phase = "PHASE_3_PROPOSALS_PENDING"
+            button = "REVIEW_AND_COMMIT"
+            action = f"Review and commit {pending_proposals} AI proposals"
+            can_run_settlement = False
+            can_run_ai = False
+        elif (not settlement_ran) and ai_matches == 0:
+            phase = "PHASE_1_INGESTION"
+            button = "RUN_SETTLEMENT_ENGINE"
+            action = "Run deterministic settlement engine to match trades"
+            can_run_settlement = True
+            can_run_ai = False
+        elif settlement_ran and ai_matches == 0 and open_breaks > 0:
+            phase = "PHASE_2_SETTLEMENT_COMPLETE"
+            button = "AUTO_RESOLVE"
+            action = f"Run AI auto-resolve ({open_breaks} breaks remaining)"
+            can_run_settlement = False
+            can_run_ai = True
+        elif open_breaks == 0 and total_trades > 0:
+            phase = "PHASE_3_COMPLETE"
+            button = None
+            action = "Reconciliation complete"
+            can_run_settlement = False
+            can_run_ai = False
+        else:
+            # Mixed states (e.g., partial AI run)
+            phase = "PHASE_3_COMPLETE"
+            button = "AUTO_RESOLVE" if open_breaks > 0 else None
+            action = "Reconciliation complete"
+            can_run_settlement = False
+            can_run_ai = open_breaks > 0
+        
+        return {
+            "status": "success",
+            "workflow": {
+                "current_phase": phase,
+                "button_to_show": button,
+                "next_action": action,
+                "pending_proposals": pending_proposals,
+                "can_run_settlement_engine": can_run_settlement,
+                "can_run_auto_resolve": can_run_ai
+            },
+            "statistics": {
+                "total_trades": total_trades,
+                "unsettled_trades": unsettled_trades,
+                "rule_matched": rule_matches,
+                "ai_matched": ai_matches,
+                "open_breaks": open_breaks,
+                "pending_proposals": pending_proposals,
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get workflow status: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get workflow status: {str(e)}"
+        )
+
+
 @router.get("/breaks")
 def get_breaks(
     user_id: str = Depends(get_current_user), 
@@ -287,6 +702,13 @@ def get_breaks(
 ) -> Dict[str, Any]:
     """
     Get reconciliation breaks.
+    
+    **3-PHASE WORKFLOW:**
+    - After Phase 1 (Ingestion): Returns empty list (no reconciliation yet)
+    - After Phase 2 (Settlement Engine): Returns breaks created by rules
+    - After Phase 3 (Auto Resolve): Returns remaining breaks after AI
+    
+    These are RECONCILIATION breaks (matching failures), not ingestion/DQ issues.
     """
     try:
         breaks = db.query(ReconBreak).filter(
@@ -328,17 +750,108 @@ def get_dashboard_stats(
 ) -> Dict[str, Any]:
     """
     Get dashboard statistics with real data from database.
+    
+    **3-PHASE WORKFLOW - READ-ONLY ENDPOINT:**
+    Returns which phase the system is in and which button to show:
+    - Phase 1 (After Ingestion): Show "RUN SETTLEMENT ENGINE" button
+    - Phase 2 (After Settlement): Show "AUTO RESOLVE" button  
+    - Phase 3 (After AI): Reconciliation complete
+    
+    Phase detection logic:
+    - If no RULE-based matches exist → Phase 1 (button: RUN SETTLEMENT ENGINE)
+    - If RULE matches exist but AI matches don't → Phase 2 (button: AUTO RESOLVE)
+    - If both exist → Phase 3 (complete)
+    
+    This endpoint does NOT trigger any reconciliation logic.
+    
     Includes trades, cash, holdings (AUC), NAV, and break statistics.
     """
     try:
+        # Detect current phase based on resolution types
+        rule_matches = db.execute(
+            text("""
+                SELECT COUNT(*) FROM broker_trades 
+                WHERE tenant_id = :tid 
+                AND status = 'MATCHED' 
+                AND bank_ref LIKE 'RULE:%'
+            """),
+            {"tid": user_id}
+        ).scalar() or 0
+        
+        ai_matches = db.execute(
+            text("""
+                SELECT COUNT(*) FROM broker_trades 
+                WHERE tenant_id = :tid 
+                AND status = 'MATCHED' 
+                AND (bank_ref LIKE 'AI_COMMIT:%' OR bank_ref LIKE 'AI:%')
+            """),
+            {"tid": user_id}
+        ).scalar() or 0
+        
+        total_trades = db.execute(
+            text("SELECT COUNT(*) FROM broker_trades WHERE tenant_id = :tid"),
+            {"tid": user_id}
+        ).scalar() or 0
+
+        # --- FIX START: CORRECT PENDING MATH (no double counting) ---
+        # Total pending = trades that are NOT MATCHED.
+        # We do NOT add open breaks to this, because every break belongs to an unsettled trade.
+        pending_count = db.execute(
+            text("""
+                SELECT COUNT(*) FROM broker_trades
+                WHERE tenant_id = :tid
+                  AND (status != 'MATCHED' OR status IS NULL)
+            """),
+            {"tid": user_id},
+        ).scalar() or 0
+        # --- FIX END ---
+
+        pending_proposals = (
+            db.query(ReconProposal)
+            .filter(
+                ReconProposal.tenant_id == user_id,
+                ReconProposal.status == "PENDING",
+            )
+            .count()
+        )
+        
+        # Determine phase and next action
+        # NOTE: A stress test can yield 0 matches but many breaks — that still means the engine ran.
+        if total_trades == 0:
+            current_phase = "PHASE_0_NO_DATA"
+            next_action = "Upload files to begin"
+            button_to_show = None
+        else:
+            open_breaks_count = db.execute(
+                text("SELECT COUNT(*) FROM recon_breaks WHERE tenant_id = :tid AND status = 'OPEN'"),
+                {"tid": user_id},
+            ).scalar() or 0
+            settlement_ran = (rule_matches > 0) or (open_breaks_count > 0)
+
+            if pending_proposals > 0:
+                current_phase = "PHASE_3_PROPOSALS_PENDING"
+                next_action = f"Review and commit {pending_proposals} AI proposals"
+                button_to_show = "REVIEW_AND_COMMIT"
+            elif (not settlement_ran) and ai_matches == 0:
+                current_phase = "PHASE_1_INGESTION"
+                next_action = "Run deterministic settlement engine"
+                button_to_show = "RUN_SETTLEMENT_ENGINE"
+            elif settlement_ran and ai_matches == 0:
+                current_phase = "PHASE_2_SETTLEMENT_COMPLETE"
+                next_action = "Run AI auto-resolve on remaining breaks"
+                button_to_show = "AUTO_RESOLVE"
+            else:
+                current_phase = "PHASE_3_COMPLETE"
+                next_action = "Reconciliation complete"
+                button_to_show = None
+
         # Get trade statistics
         trade_stats = db.query(
             func.count(BrokerTrade.id).label("total"),
             func.sum(case((BrokerTrade.status == "MATCHED", 1), else_=0)).label("settled"),
-            func.sum(case((BrokerTrade.status.in_(["UNSETTLED", "BREAK"]), 1), else_=0)).label("unsettled"),
             func.sum(BrokerTrade.amount).label("total_amount"),
         ).filter(BrokerTrade.tenant_id == user_id).first()
-        
+
         # Get cash statistics
         cash_stats = db.query(
             func.count(BankTxn.id).label("total"),
@@ -346,28 +859,30 @@ def get_dashboard_stats(
             func.sum(case((BankTxn.status == "UNUSED", 1), else_=0)).label("unused"),
             func.sum(BankTxn.amount).label("total_amount"),
         ).filter(BankTxn.tenant_id == user_id).first()
-        
+
         # Get holdings statistics (Assets Under Custody)
         holdings_stats = db.query(
             func.count(Holding.id).label("total_positions"),
             func.sum(Holding.total_value).label("total_auc"),
             func.sum(Holding.quantity).label("total_units"),
         ).filter(Holding.tenant_id == user_id).first()
-        
+
         # Get NAV statistics
         nav_stats = db.query(
             func.count(NavLog.id).label("total_records"),
             func.sum(NavLog.aum).label("total_aum"),
             func.max(NavLog.date).label("latest_date"),
         ).filter(NavLog.tenant_id == user_id).first()
-        
+
         # Get break statistics
         break_stats = db.query(
             func.count(ReconBreak.id).label("total"),
             func.sum(case((ReconBreak.status == "OPEN", 1), else_=0)).label("open"),
             func.sum(case((ReconBreak.status == "RESOLVED", 1), else_=0)).label("resolved"),
         ).filter(ReconBreak.tenant_id == user_id).first()
-        
+
+        open_breaks = break_stats.open or 0
+
         # Get last reconciliation run info (simpler query to avoid schema issues)
         try:
             last_recon = db.query(
@@ -376,17 +891,31 @@ def get_dashboard_stats(
             ).filter(ReconLog.tenant_id == user_id).first()
         except Exception:
             last_recon = None
-        
+
         # Calculate AUC (Assets Under Custody) - sum of holdings value
         auc = float(holdings_stats.total_auc) if holdings_stats and holdings_stats.total_auc else 0.0
-        
+
         return {
             "status": "success",
             "tenant_id": user_id,
+            "pending_settlements": pending_count,  # <-- Correct, non-double-counting number
+            "proposals_pending": pending_proposals,
+            "workflow": {
+                "current_phase": current_phase,
+                "next_action": next_action,
+                "button_to_show": button_to_show,
+                "pending_proposals": pending_proposals,
+                "phase_progress": {
+                    "ingestion": total_trades > 0,
+                    "settlement_engine": (rule_matches > 0) or (open_breaks > 0),
+                    "auto_resolve": ai_matches > 0
+                }
+            },
             "trades": {
                 "total": trade_stats.total or 0,
                 "settled": trade_stats.settled or 0,
-                "unsettled": trade_stats.unsettled or 0,
+                # Back-compat: keep this field, but make it consistent with pending_count
+                "unsettled": pending_count,
                 "total_amount": float(trade_stats.total_amount) if trade_stats.total_amount else 0.0
             },
             "cash": {
@@ -407,7 +936,7 @@ def get_dashboard_stats(
             },
             "breaks": {
                 "total": break_stats.total or 0,
-                "open": break_stats.open or 0,
+                "open": open_breaks,
                 "resolved": break_stats.resolved or 0
             },
             "reconciliation": {
@@ -418,7 +947,7 @@ def get_dashboard_stats(
             # Summary metrics for quick dashboard display
             "summary": {
                 "auc": auc,
-                "open_breaks": break_stats.open or 0,
+                "open_breaks": open_breaks,  # subset of pending, shown for context
                 "match_rate": round((trade_stats.settled or 0) / max(trade_stats.total or 1, 1) * 100, 1)
             }
         }
@@ -428,6 +957,16 @@ def get_dashboard_stats(
         return {
             "status": "success",
             "tenant_id": user_id,
+            "workflow": {
+                "current_phase": "PHASE_0_NO_DATA",
+                "next_action": "Upload files to begin",
+                "button_to_show": None,
+                "phase_progress": {
+                    "ingestion": False,
+                    "settlement_engine": False,
+                    "auto_resolve": False
+                }
+            },
             "trades": {"total": 0, "settled": 0, "unsettled": 0, "total_amount": 0.0},
             "cash": {"total": 0, "used": 0, "unused": 0, "total_amount": 0.0},
             "holdings": {"total_positions": 0, "total_auc": 0.0, "total_units": 0.0},
@@ -508,12 +1047,34 @@ def get_nav_data(
 
 
 @router.post("/ai-resolve")
-def run_ai_resolve(
+def run_ai_resolve_legacy(
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """
-    Run AI agent to automatically resolve breaks.
+    DEPRECATED: Use /auto-resolve instead.
+    
+    This endpoint has been replaced by the unified /auto-resolve endpoint
+    which performs both deterministic and AI-based reconciliation in a single flow.
+    
+    Kept for backward compatibility with existing frontend code.
+    """
+    return {
+        "status": "deprecated",
+        "message": "This endpoint is deprecated. Please use /auto-resolve instead, which performs both deterministic rules and AI reasoning.",
+        "redirect": "/api/v1/recon/auto-resolve"
+    }
+
+@router.post("/ai-resolve-standalone")
+def run_ai_resolve_standalone(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    LEGACY STANDALONE AI RESOLVE (for testing/development only).
+    
+    Runs ONLY the AI phase on existing open breaks.
+    Does NOT run deterministic rules first.
     
     CONFIDENCE THRESHOLDS:
     - >= 0.85: High confidence, auto-resolve
@@ -669,6 +1230,173 @@ def run_ai_resolve(
             status_code=500,
             detail=f"AI resolve failed: {str(e)}"
         )
+
+
+@router.post("/resolve-manual/{trade_id}")
+def resolve_manual_no_body(
+    trade_id: int,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Convenience endpoint for the Glass Box UI.
+
+    Accepts no request body and performs a manual resolve with a default note.
+    This keeps the frontend simple (one click) while still persisting the
+    resolution in the DB (trade MATCHED, breaks RESOLVED, audit log written).
+
+    NOTE: This wraps the existing /resolve-trade/{trade_id} endpoint.
+    """
+    payload = ManualResolveRequest(cash_id=None, note="Manual Resolve")
+    return manual_resolve_trade(trade_id=trade_id, payload=payload, user_id=user_id, db=db)
+
+
+@router.post("/resolve-bulk")
+def resolve_bulk_trades(
+    payload: BulkResolveRequest,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Resolve multiple trades at once.
+
+    Behavior:
+    - Iterates trade_ids
+    - Attempts to resolve each trade independently
+    - Continues on failures (partial success)
+    """
+    resolved_count = 0
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    trade_ids = payload.trade_ids or []
+    logger.info(f"Bulk resolving {len(trade_ids)} trades for tenant {user_id}")
+
+    for trade_id in trade_ids:
+        try:
+            single_req = ManualResolveRequest(note=payload.note)
+            res = manual_resolve_trade(
+                trade_id=trade_id,
+                payload=single_req,
+                user_id=user_id,
+                db=db,
+            )
+
+            # manual_resolve_trade can return {"status": "warning"} if already resolved
+            if isinstance(res, dict) and res.get("status") == "warning":
+                warnings.append(f"ID {trade_id}: {res.get('message', 'Already resolved')}")
+            else:
+                resolved_count += 1
+        except Exception as e:
+            logger.error(f"Failed to resolve trade {trade_id}: {str(e)}")
+            errors.append(f"ID {trade_id}: {str(e)}")
+            # continue
+
+    return {
+        "status": "success",
+        "resolved_count": resolved_count,
+        "failed_count": len(errors),
+        "warning_count": len(warnings),
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+@router.post("/proposals/commit")
+def commit_proposals(
+    payload: Optional[CommitProposalsRequest] = Body(default=None),
+    min_confidence: float = 0.90,  # Safety threshold (query param fallback)
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    EXECUTOR: Applies pending AI proposals to the Ledger.
+    Only applies proposals above the confidence threshold.
+    """
+    with acquire_tenant_lock(db, user_id, "Committing Proposals"):
+        try:
+            threshold = (
+                float(payload.min_confidence)
+                if payload and payload.min_confidence is not None
+                else float(min_confidence)
+            )
+            proposals = (
+                db.query(ReconProposal)
+                .filter(
+                    ReconProposal.tenant_id == user_id,
+                    ReconProposal.status == "PENDING",
+                    ReconProposal.confidence >= threshold,
+                )
+                .all()
+            )
+
+            committed_count = 0
+            errors: List[str] = []
+
+            for p in proposals:
+                try:
+                    # Use nested transaction so one failure doesn't poison the whole batch
+                    with db.begin_nested():
+                        trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).first()
+                        if not trade or trade.status == "MATCHED":
+                            p.status = "REJECTED"
+                            p.processed_at = datetime.utcnow()
+                            continue
+
+                        trade.status = "MATCHED"
+                        trade.bank_ref = f"AI_COMMIT:{(p.explanation or '')[:100]} (conf: {float(p.confidence or 0):.2f})"
+
+                        if p.cash_id:
+                            cash = db.query(BankTxn).filter_by(id=p.cash_id, tenant_id=user_id).first()
+                            if cash:
+                                cash.status = "MATCHED"
+                                cash.trade_ref = trade.id
+
+                        if p.break_id:
+                            brk = db.query(ReconBreak).filter_by(id=p.break_id, tenant_id=user_id).first()
+                            if brk:
+                                brk.status = "RESOLVED"
+                                brk.resolution_note = "Auto-Commited from AI Proposal"
+
+                        p.status = "APPROVED"
+                        p.processed_at = datetime.utcnow()
+
+                        # Audit log
+                        db.add(
+                            ReconLog(
+                                tenant_id=user_id,
+                                trade_id=trade.id,
+                                cash_id=p.cash_id,
+                                reason=f"AI_COMMIT: {((p.explanation or '')[:150])}",
+                                status_before="OPEN",
+                                status_after="MATCHED",
+                                agent_model="AI_EXECUTOR",
+                            )
+                        )
+
+                        # Apply holdings update (same accounting logic as manual)
+                        from .rule_engine.orchestrator import ReconOrchestrator
+                        orchestrator = ReconOrchestrator(db, user_id)
+                        orchestrator._apply_single_trade_to_holdings(trade)
+
+                        committed_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to commit proposal {p.id}: {str(e)}")
+                    errors.append(f"proposal {p.id}: {str(e)}")
+                    db.rollback()
+
+            db.commit()
+
+            return {
+                "status": "success",
+                "committed": committed_count,
+                "threshold_used": threshold,
+                "failed": len(errors),
+                "errors": errors,
+            }
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/resolve-trade/{trade_id}")
@@ -843,32 +1571,154 @@ def system_reset(
         logger.error(f"System reset failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"System reset failed: {str(e)}")
 
-@router.get("/export-data")
-def export_data(
+@router.get("/export-csv")
+def export_reconciliation_report(
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
-    Export reconciliation data (placeholder - returns metadata).
-    TODO: Implement actual CSV export
+    Generate and download a full reconciliation audit report as CSV.
+
+    Columns:
+    Trade ID, Date, Symbol, Side, Amount, Status, Resolution Type, Resolution Note, AI Confidence
     """
     try:
-        trade_count = db.query(func.count(BrokerTrade.id)).filter(
-            BrokerTrade.tenant_id == user_id
-        ).scalar()
-        
-        return {
-            "status": "success",
-            "tenant_id": user_id,
-            "export_url": f"/api/v1/recon/exports/report_{user_id}.csv",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "format": "csv",
-            "record_count": trade_count or 0,
-            "message": "Export endpoint - actual file generation not yet implemented"
-        }
+        logger.info(f"Generating CSV export for tenant {user_id}")
+
+        # Join trades with (optional) open break + matched cash txn
+        from sqlalchemy.orm import aliased
+        from sqlalchemy import and_
+        import re
+
+        Break = aliased(ReconBreak)
+        Cash = aliased(BankTxn)
+
+        # Pick one OPEN break per trade (lowest id) to avoid duplicates
+        open_break_sq = (
+            db.query(
+                ReconBreak.trade_id.label("trade_id"),
+                func.min(ReconBreak.id).label("break_id"),
+            )
+            .filter(
+                ReconBreak.tenant_id == user_id,
+                ReconBreak.status == "OPEN",
+            )
+            .group_by(ReconBreak.trade_id)
+            .subquery()
+        )
+
+        # Pick one matched cash row per trade (lowest id) to avoid duplicates
+        cash_sq = (
+            db.query(
+                BankTxn.trade_ref.label("trade_ref"),
+                func.min(BankTxn.id).label("cash_id"),
+            )
+            .filter(
+                BankTxn.tenant_id == user_id,
+                BankTxn.trade_ref.isnot(None),
+            )
+            .group_by(BankTxn.trade_ref)
+            .subquery()
+        )
+
+        rows = (
+            db.query(BrokerTrade, Break, Cash)
+            .outerjoin(open_break_sq, open_break_sq.c.trade_id == BrokerTrade.id)
+            .outerjoin(Break, Break.id == open_break_sq.c.break_id)
+            .outerjoin(cash_sq, cash_sq.c.trade_ref == BrokerTrade.id)
+            .outerjoin(Cash, Cash.id == cash_sq.c.cash_id)
+            .filter(BrokerTrade.tenant_id == user_id)
+            .order_by(BrokerTrade.date.desc())
+            .all()
+        )
+
+        def _parse_ai_confidence(text_val: str) -> Optional[float]:
+            if not text_val:
+                return None
+            # supports "(conf: 0.92)" or "confidence: 0.92"
+            m = re.search(r"(?:conf(?:idence)?\s*[:=]\s*)(0(?:\.\d+)?|1(?:\.0+)?)", text_val, re.IGNORECASE)
+            if not m:
+                return None
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+
+        def generate():
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            writer.writerow(
+                [
+                    "Trade ID",
+                    "Date",
+                    "Symbol",
+                    "Side",
+                    "Amount",
+                    "Status",
+                    "Resolution Type",
+                    "Resolution Note",
+                    "AI Confidence",
+                ]
+            )
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+
+            for t, brk, cash in rows:
+                # Status (BREAK is derived)
+                status = t.status or "UNSETTLED"
+                if status in ("UNSETTLED", None) and brk is not None:
+                    status = "BREAK"
+
+                # Resolution type + note
+                resolution_type = "PENDING"
+                resolution_note = ""
+                ai_conf = None
+
+                if t.status == "MATCHED":
+                    if t.bank_ref and ":" in t.bank_ref:
+                        prefix, note = t.bank_ref.split(":", 1)
+                        resolution_type = prefix.strip().upper()
+                        resolution_note = note.strip()
+                    else:
+                        resolution_type = "MATCHED_UNKNOWN"
+                        resolution_note = t.bank_ref or ""
+
+                    if resolution_type == "AI":
+                        ai_conf = _parse_ai_confidence(t.bank_ref or "")
+
+                else:
+                    if brk is not None:
+                        resolution_type = "OPEN_BREAK"
+                        sev = brk.severity.value if getattr(brk, "severity", None) else "MEDIUM"
+                        resolution_note = f"{brk.break_type} - {sev}"
+                        ai_conf = _parse_ai_confidence(getattr(brk, "resolution_note", "") or "")
+
+                writer.writerow(
+                    [
+                        t.id,
+                        t.date.isoformat() if t.date else "",
+                        t.symbol or "",
+                        t.side or "",
+                        float(to_decimal(t.amount)),
+                        status,
+                        resolution_type,
+                        resolution_note,
+                        f"{ai_conf:.2f}" if ai_conf is not None else "",
+                    ]
+                )
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+
+        filename = f"aureon_report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        return StreamingResponse(
+            generate(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     except Exception as e:
         logger.error(f"Export failed: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Export failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")

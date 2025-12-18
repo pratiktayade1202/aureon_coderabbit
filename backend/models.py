@@ -152,6 +152,29 @@ class ReconLog(Base):
     reason = Column(String)
     agent_model = Column(String)
 
+
+class ReconProposal(Base):
+    __tablename__ = "recon_proposals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String, index=True)
+
+    # What is the AI proposing?
+    trade_id = Column(Integer, ForeignKey("broker_trades.id"))
+    cash_id = Column(Integer, ForeignKey("bank_txns.id"), nullable=True)
+    break_id = Column(Integer, ForeignKey("recon_breaks.id"), nullable=True)
+
+    # Why?
+    confidence = Column(Float)
+    explanation = Column(String)
+    source_model = Column(String)  # "Gemini-2.0-Flash", "GPT-4o"
+
+    # Status of the proposal itself
+    status = Column(String, default="PENDING")  # PENDING, APPROVED, REJECTED
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
+
+
 class RuleMemory(Base):
     __tablename__ = "rule_memory"
     
@@ -193,3 +216,17 @@ class ProcessedFile(Base):
     __table_args__ = (
         UniqueConstraint('tenant_id', 'file_hash', name='uq_processed_file_tenant_hash'),
     )
+
+# --- 5. TENANT ISOLATION (MUTEX LOCKS) ---
+
+class ReconLock(Base):
+    """
+    Mutex lock to prevent concurrent heavy operations for a single tenant.
+    Only one "Heavy Job" can run per tenant at a time.
+    """
+    __tablename__ = "recon_locks"
+    
+    tenant_id = Column(String, primary_key=True, index=True)
+    locked_until = Column(DateTime, nullable=False)
+    process_name = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)

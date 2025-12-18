@@ -11,13 +11,14 @@ All AI calls route through llm_gateway.reason_on_discrepancy().
 """
 
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, desc
 import json
 import logging
 from typing import Dict, Any, List, Optional
 
 # Use the unified gateway interface
 from ..llm_gateway import LLMGateway
+from ..models import LearningEvent
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,8 @@ class AIAgent:
         
         # 2. Search for Cash Candidates (Amount match +/- 1%)
         # Include both 'UNUSED' status and NULL status (common after fresh ingestion)
-        target_amount = abs(float(trade.amount or 0))
+        # NOTE: `trade` is a SQLAlchemy RowMapping; use the dict for access.
+        target_amount = abs(float(trade_data.get("amount") or 0))
         if target_amount == 0:
             logger.warning(f"Trade {trade_id} has zero amount, cannot match")
             return {
@@ -250,6 +252,67 @@ class AIAgent:
             }
         }
 
+    def _fetch_relevant_learnings(self, trade: dict) -> List[Dict[str, Any]]:
+        """
+        ACTIVE LEARNING CORE: Retrieve past manual resolutions (few-shot examples).
+
+        Strategy:
+        - Pull last 50 HUMAN_MANUAL events for this tenant
+        - Prioritize events whose trade_data.symbol matches current trade.symbol
+        - Return up to 3 examples formatted for prompt injection
+        """
+        try:
+            symbol = (trade.get("symbol") or "").strip()
+
+            events = (
+                self.db.query(LearningEvent)
+                .filter(
+                    LearningEvent.tenant_id == self.tenant_id,
+                    LearningEvent.source == "HUMAN_MANUAL",
+                )
+                .order_by(desc(LearningEvent.timestamp))
+                .limit(50)
+                .all()
+            )
+
+            relevant: List[LearningEvent] = []
+
+            # 1) Symbol-specific learnings first
+            if symbol:
+                for e in events:
+                    t_data = e.trade_data or {}
+                    if (t_data.get("symbol") or "").strip() == symbol:
+                        relevant.append(e)
+                        if len(relevant) >= 3:
+                            break
+
+            # 2) Backfill with recent generic learnings
+            if len(relevant) < 3:
+                for e in events:
+                    if e in relevant:
+                        continue
+                    relevant.append(e)
+                    if len(relevant) >= 3:
+                        break
+
+            formatted: List[Dict[str, Any]] = []
+            for e in relevant[:3]:
+                t_data = e.trade_data or {}
+                formatted.append(
+                    {
+                        "symbol": t_data.get("symbol"),
+                        "trade_amount": t_data.get("amount"),
+                        "cash_id": t_data.get("cash_id"),
+                        "cash_amount": t_data.get("cash_amount"),
+                        "note": e.correction_notes,
+                    }
+                )
+
+            return formatted
+        except Exception as e:
+            logger.warning(f"Failed to fetch learnings: {e}")
+            return []
+
     def _get_ai_reasoning(self, trade: dict, candidates: list) -> Optional[Dict[str, Any]]:
         """
         Use AI to analyze ambiguous matches and provide reasoning.
@@ -293,6 +356,16 @@ class AIAgent:
                     "amount": float(c.get("amount") or 0),
                     "description": str(c.get("description") or "")[:100],
                 })
+
+            # === Phase 3: Active Learning (Few-shot context injection) ===
+            past_learnings = self._fetch_relevant_learnings(trade)
+            learnings_text = ""
+            if past_learnings:
+                learnings_text = (
+                    "PAST HUMAN RESOLUTIONS (USE AS GUIDANCE; DO NOT HALLUCINATE):\n"
+                    + json.dumps(past_learnings, indent=2)
+                    + "\n"
+                )
             
             # Build context for AI reasoning
             context = f"""Analyze this financial reconciliation scenario and determine the best match.
@@ -303,11 +376,14 @@ TRADE TO RECONCILE:
 CANDIDATE CASH ENTRIES:
 {json.dumps(candidates_summary, indent=2)}
 
+{learnings_text}
+
 ANALYSIS CRITERIA:
 1. Amount similarity (most important - exact match is ideal)
 2. Date proximity (consider T+0, T+1, T+2 settlement cycles)
 3. Description relevance (look for trade IDs, symbols, references)
 4. Currency consistency
+5. If a past human resolution is highly similar, prefer that logic (within reason).
 
 REQUIRED OUTPUT (JSON):
 {{

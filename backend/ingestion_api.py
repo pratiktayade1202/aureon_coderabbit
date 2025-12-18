@@ -16,15 +16,61 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pydantic import BaseModel
+from contextlib import contextmanager
+from datetime import timedelta
 
 from .database import get_db
 from .auth import get_current_user
 from .ingestion import process_file_content
 from .config import settings
-from .models import ProcessedFile
+from .models import ProcessedFile, ReconLock
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+# --- TENANT ISOLATION: MUTEX LOCK HELPER ---
+@contextmanager
+def acquire_tenant_lock(db: Session, user_id: str, process_name: str, timeout_seconds: int = 300):
+    """
+    Context manager to enforce single-threaded execution per tenant.
+    Raises 409 if locked. Releases lock on exit.
+    
+    PHASE 3: TENANT ISOLATION (The Traffic Cop)
+    Prevents concurrent heavy operations (upload, settlement, AI resolve, commit).
+    """
+    now = datetime.utcnow()
+    
+    # 1. Check existing lock
+    lock = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+    
+    if lock and lock.locked_until > now:
+        remaining = int((lock.locked_until - now).total_seconds())
+        raise HTTPException(
+            status_code=409, 
+            detail=f"System is busy processing '{lock.process_name}'. Please wait {remaining} seconds."
+        )
+    
+    # 2. Acquire Lock
+    expiry = now + timedelta(seconds=timeout_seconds)
+    if not lock:
+        lock = ReconLock(tenant_id=user_id, locked_until=expiry, process_name=process_name)
+        db.add(lock)
+    else:
+        lock.locked_until = expiry
+        lock.process_name = process_name
+    
+    db.commit()
+    
+    try:
+        yield  # Allow endpoint to run
+    finally:
+        # 3. Release Lock (by expiring it immediately)
+        # We fetch again to be safe in case of session weirdness, though usually object is attached
+        lock = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+        if lock:
+            lock.locked_until = datetime.utcnow()  # Expire it
+            db.commit()
 
 # --- CONFIGURATION ---
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
@@ -109,12 +155,17 @@ def sanitize_filename(filename: str) -> str:
 @router.post("/upload", response_model=UploadResponse)
 async def upload_file(
     file: UploadFile = File(...),
-    skip_duplicates: bool = Query(default=True, description="Skip files that have already been processed"),
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Upload and process a financial data file.
+    Ingest a file with Deduplication Protection (SHA256).
+    
+    PHASE 2: INGESTION SAFETY (The Fingerprint)
+    - Calculates SHA256 hash before processing
+    - Rejects duplicate files (409 Conflict) if already COMPLETED
+    - Tracks PROCESSING state before ingestion
+    - Updates to COMPLETED on success, FAILED on error
     
     Supported formats:
     - CSV (.csv)
@@ -129,7 +180,6 @@ async def upload_file(
     - NAV (fund NAV reports)
     """
     start_time = datetime.utcnow()
-    temp_path = None
     
     try:
         # --- VALIDATION ---
@@ -154,110 +204,105 @@ async def upload_file(
         # 4. Check file size
         validate_file_size(file)
         
-        # --- READ FILE ---
-        content = await file.read()
-        file_size = len(content)
-        file_hash = calculate_file_hash(content)
-        
-        # 5. Check for duplicates
-        if skip_duplicates:
-            existing = check_duplicate_file(db, user_id, file_hash)
-            if existing:
-                return UploadResponse(
-                    status="skipped",
-                    message=f"File already processed on {existing.processed_at.isoformat()}",
-                    logs=[f"Duplicate of: {existing.filename}"],
-                    rows=existing.rows_processed,
-                    type="Duplicate",
-                    file_hash=file_hash
+        # --- TENANT ISOLATION: Acquire Lock ---
+        with acquire_tenant_lock(db, user_id, f"Ingesting {original_filename}"):
+            # --- READ FILE & HASH (The Fingerprint) ---
+            content = await file.read()
+            file_size = len(content)
+            file_hash = calculate_file_hash(content)
+            
+            # Reset cursor for processing (if needed)
+            await file.seek(0)
+            
+            # --- STEP 2: Check for Duplicates (COMPLETED status only) ---
+            existing_file = db.query(ProcessedFile).filter(
+                ProcessedFile.tenant_id == user_id,
+                ProcessedFile.file_hash == file_hash,
+                ProcessedFile.status == "COMPLETED"  # Only block if it actually succeeded before
+            ).first()
+            
+            if existing_file:
+                logger.warning(f"Duplicate upload blocked: {original_filename} ({file_hash})")
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Duplicate file detected. This file was already processed on {existing_file.processed_at.strftime('%Y-%m-%d %H:%M')}."
                 )
-        
-        # --- PROCESS FILE ---
-        logs = []
-        filename_lower = original_filename.lower()
-        
-        # Create temp file in proper temp directory
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(safe_filename)[1]) as tmp:
-            tmp.write(content)
-            temp_path = tmp.name
-        
-        try:
-            if filename_lower.endswith(".zip"):
-                # Process ZIP archive
-                try:
-                    with zipfile.ZipFile(temp_path, "r") as z:
-                        # Security: Check for zip bombs
-                        total_uncompressed = sum(info.file_size for info in z.infolist())
-                        if total_uncompressed > MAX_FILE_SIZE_BYTES * 10:
-                            raise HTTPException(
-                                status_code=400,
-                                detail="ZIP archive is too large when uncompressed"
-                            )
-                        
-                        for subfile in z.namelist():
-                            # Skip hidden files and directories
-                            if subfile.startswith(("__", ".")) or subfile.endswith("/"):
-                                continue
-                            
-                            # Validate extension
-                            if not any(subfile.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS - {".zip"}):
-                                logs.append(f"{subfile} -> Skipped (unsupported format)")
-                                continue
-                            
-                            with z.open(subfile) as f:
-                                sub_content = f.read()
-                                result = process_file_content(sub_content, subfile, user_id)
-                                logs.append(f"{subfile} -> {result.get('status', 'Unknown')}")
-                                
-                except zipfile.BadZipFile:
-                    raise HTTPException(status_code=400, detail="Invalid or corrupted ZIP file")
-            else:
-                # Process single file
+            
+            # --- STEP 3: Track the Attempt (PROCESSING state) ---
+            processed_record = ProcessedFile(
+                tenant_id=user_id,
+                filename=original_filename,
+                file_hash=file_hash,
+                file_size=file_size,
+                status="PROCESSING"
+            )
+            db.add(processed_record)
+            db.commit()  # Commit "PROCESSING" state immediately
+            
+            # --- STEP 4: Run Ingestion Logic ---
+            logs = []
+            filename_lower = original_filename.lower()
+            total_rows = 0
+            
+            try:
+                # Process file content directly (no temp file needed for ingestion.py)
                 result = process_file_content(content, original_filename, user_id)
-                logs.extend(result.get("logs", [f"{original_filename} -> {result.get('status', 'Unknown')}"]))
-        
-        finally:
-            # Clean up temp file
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-                temp_path = None
-        
-        # --- RECORD PROCESSING ---
-        processed_record = ProcessedFile(
-            tenant_id=user_id,
-            filename=original_filename,
-            file_hash=file_hash,
-            file_size=file_size,
-            status="COMPLETED",
-            rows_processed=len(logs)
-        )
-        db.add(processed_record)
-        db.commit()
-        
-        # Calculate processing time
-        end_time = datetime.utcnow()
-        processing_time_ms = int((end_time - start_time).total_seconds() * 1000)
-        
-        logger.info(f"File processed: {original_filename} for tenant {user_id} in {processing_time_ms}ms")
-        
-        return UploadResponse(
-            status="success",
-            message="File processed successfully",
-            logs=logs,
-            rows=len(logs),
-            type="Batch" if filename_lower.endswith(".zip") else "Single",
-            file_hash=file_hash,
-            processing_time_ms=processing_time_ms
-        )
+                logs = result.get("logs", [])
+                total_rows = result.get("total_rows", 0)
+                
+                # If ingestion didn't return total_rows, try to count from logs
+                if total_rows == 0:
+                    # Fallback: count rows from ingestion logs (less accurate)
+                    total_rows = len([l for l in logs if "rows" in l.lower() or "processed" in l.lower()])
+                
+                # --- STEP 5: Mark Success ---
+                processed_record.status = "COMPLETED"
+                processed_record.rows_processed = total_rows
+                db.add(processed_record)
+                db.commit()
+                
+                # Calculate processing time
+                end_time = datetime.utcnow()
+                processing_time_ms = int((end_time - start_time).total_seconds() * 1000)
+                
+                logger.info(f"File processed: {original_filename} for tenant {user_id} in {processing_time_ms}ms ({total_rows} rows)")
+                
+                return UploadResponse(
+                    status="success",
+                    message=f"Successfully processed {original_filename}",
+                    logs=logs,
+                    rows=total_rows,
+                    type="Batch" if filename_lower.endswith(".zip") else "Single",
+                    file_hash=file_hash,
+                    processing_time_ms=processing_time_ms
+                )
+                    
+            except Exception as e:
+                # --- STEP 6: Handle Failure ---
+                db.rollback()  # Rollback any partial trade inserts from ingestion
+                processed_record.status = "FAILED"
+                processed_record.errors = str(e)[:500]  # Truncate error if too long
+                db.add(processed_record)
+                db.commit()
+                
+                logger.error(f"Ingestion failed for {original_filename}: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
     
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Upload failed for {file.filename}: {str(e)}", exc_info=True)
         
-        # Record failure
+        # Record failure (if we got past hash calculation)
         try:
-            if 'file_hash' in locals():
+            if 'file_hash' in locals() and 'processed_record' in locals():
+                # Update existing PROCESSING record to FAILED
+                processed_record.status = "FAILED"
+                processed_record.errors = str(e)[:500]
+                db.add(processed_record)
+                db.commit()
+            elif 'file_hash' in locals():
+                # Create new FAILED record if PROCESSING record wasn't created
                 failed_record = ProcessedFile(
                     tenant_id=user_id,
                     filename=file.filename or "unknown",
@@ -265,7 +310,7 @@ async def upload_file(
                     file_size=len(content) if 'content' in locals() else 0,
                     status="FAILED",
                     rows_processed=0,
-                    errors=str(e)
+                    errors=str(e)[:500]
                 )
                 db.add(failed_record)
                 db.commit()
@@ -276,13 +321,6 @@ async def upload_file(
             status_code=500,
             detail=f"File processing failed: {str(e)}"
         )
-    finally:
-        # Ensure cleanup
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
 
 
 @router.get("/upload/history")

@@ -1,12 +1,11 @@
 # backend/llm_gateway.py
 """
-Production-grade LLM Gateway with retry logic and failover.
+Production-grade LLM Gateway - Gemini First Architecture.
 
 Architecture:
-- Gemini 2.5 Pro: Primary model for parsing and reasoning (paid tier with credits)
-- GPT-4o: Secondary/fallback for reasoning tasks
-- No simulation mode - all failures are logged and propagated
-- Retry logic with exponential backoff for transient failures
+- Gemini 2.0 Flash Exp: PRIMARY model for parsing AND reasoning.
+- GPT-4o: OPTIONAL fallback (only used if configured and Gemini fails).
+- Retry logic with exponential backoff.
 """
 import json
 import logging
@@ -26,34 +25,41 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 # === Model Configuration ===
-GEMINI_MODEL = getattr(settings, "gemini_model", None) or "gemini-2.5-pro"
+GEMINI_MODEL = getattr(settings, "gemini_model", None) or "gemini-2.0-flash-exp"
 OPENAI_MODEL = settings.openai_model
 
-logger.info(f"LLM Gateway initialized with Gemini: {GEMINI_MODEL}, OpenAI: {OPENAI_MODEL}")
+# Gemini supports very large context windows; don't artificially throttle input.
+# Keep this as characters (not tokens) since we typically start from raw text.
+GEMINI_PARSE_MAX_CHARS = 100_000
 
-# === Configure Gemini (Primary for parsing and reasoning) ===
+logger.info(f"LLM Gateway initialized. Primary: {GEMINI_MODEL}")
+
+# === Configure Gemini (PRIMARY) ===
 try:
     genai.configure(api_key=settings.gemini_api_key)
-    logger.info(f"✓ Gemini configured successfully with model: {GEMINI_MODEL}")
+    logger.info(f"✓ Gemini configured successfully as PRIMARY.")
 except Exception as e:
-    logger.error(f"✗ Gemini configuration failed: {e}")
+    logger.critical(f"✗ Gemini configuration failed: {e}")
     raise RuntimeError(f"Failed to configure Gemini: {e}")
 
-# === Configure OpenAI (Secondary for reasoning, fallback) ===
+# === Configure OpenAI (OPTIONAL FALLBACK) ===
 openai_client: Optional[OpenAI] = None
 openai_async_client: Optional[AsyncOpenAI] = None
 
-try:
-    openai_client = OpenAI(api_key=settings.openai_api_key)
-    openai_async_client = AsyncOpenAI(api_key=settings.openai_api_key)
-    logger.info(f"✓ OpenAI configured successfully with model: {OPENAI_MODEL}")
-except Exception as e:
-    logger.warning(f"⚠ OpenAI configuration failed: {e}. Fallback disabled.")
+if settings.openai_api_key:
+    try:
+        openai_client = OpenAI(api_key=settings.openai_api_key)
+        openai_async_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        logger.info(f"✓ OpenAI configured as FALLBACK ({OPENAI_MODEL})")
+    except Exception as e:
+        logger.warning(f"⚠ OpenAI configuration failed: {e}. Fallback disabled.")
+else:
+    logger.info("ℹ OpenAI fallback disabled (Key not provided).")
 
 
 class LLMGateway:
     """
-    Production LLM Gateway with retry logic, failover, and structured error handling.
+    Gemini-First LLM Gateway.
     """
     
     @staticmethod
@@ -70,104 +76,37 @@ class LLMGateway:
         response_schema: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Parse and extract structure from documents using Gemini 2.5 Pro.
-        
-        Optimized for:
-        - PDF/CSV/Excel parsing
-        - Extracting trades, cash transactions, holdings, NAV data
-        - Normalizing dates to YYYY-MM-DD
-        - Converting monetary fields to numeric
-        
-        Args:
-            content: Document content (text, CSV, or JSON string)
-            doc_type: Type of document (trade, cash, holding, nav, generic)
-            response_schema: Optional JSON schema to enforce structure
-            
-        Returns:
-            Dict with parsed structured data
-            
-        Raises:
-            Exception: If parsing fails after retries
+        Parse documents using Gemini (Primary).
         """
         logger.info(f"Parsing document type: {doc_type} (length: {len(content)} chars)")
         
         # Build prompt based on document type
         prompts = {
-            "trade": """Extract all trade records from this data. For each trade:
-- date: Trade date in YYYY-MM-DD format
-- settlement_date: Settlement date in YYYY-MM-DD format (if present)
-- symbol: Security symbol/ticker
-- isin: ISIN code (if present)
-- side: BUY or SELL
-- quantity: Number of shares/units (numeric)
-- price: Price per unit (numeric)
-- amount: Total amount (numeric)
-- currency: Currency code (default INR)
-
-Return as JSON: {"trades": [...], "metadata": {"total_count": N}}
-Use null for missing fields. Do not invent data.""",
-            
-            "cash": """Extract all cash transactions from this data. For each transaction:
-- date: Transaction date in YYYY-MM-DD format
-- value_date: Value date in YYYY-MM-DD format (if present)
-- description: Transaction description
-- amount: Transaction amount (numeric, positive for credit, negative for debit)
-- balance: Running balance (numeric, if present)
-
-Return as JSON: {"transactions": [...], "metadata": {"total_count": N}}
-Use null for missing fields. Do not invent data.""",
-            
-            "holding": """Extract all position holdings from this data. For each holding:
-- date: Holding date in YYYY-MM-DD format
-- symbol: Security symbol
-- isin: ISIN code (if present)
-- quantity: Current quantity held (numeric)
-- avg_cost: Average cost per unit (numeric)
-- market_price: Current market price (numeric)
-- total_value: Total market value (numeric)
-
-Return as JSON: {"holdings": [...], "metadata": {"total_count": N}}
-Use null for missing fields. Do not invent data.""",
-            
-            "nav": """Extract NAV data from this document. For each NAV record:
-- date: NAV date in YYYY-MM-DD format
-- fund_name: Fund name
-- isin: ISIN code
-- nav_value: NAV per unit (numeric)
-- aum: Assets Under Management (numeric)
-
-Return as JSON: {"nav_records": [...], "metadata": {"total_count": N}}
-Use null for missing fields. Do not invent data.""",
-            
-            "generic": """Parse this financial data and extract structured information.
-Normalize dates to YYYY-MM-DD format.
-Convert all monetary fields to numeric values.
-Use null for missing/unavailable fields.
-Do not hallucinate data that doesn't exist in the source.
-
-Return as JSON with appropriate structure."""
+            "trade": """Extract all trade records. Return JSON: {\"trades\": [...], \"metadata\": {\"total_count\": N}}""",
+            "cash": """Extract all cash transactions. Return JSON: {\"transactions\": [...], \"metadata\": {\"total_count\": N}}""",
+            "generic": """Parse this financial data. Return structured JSON."""
         }
         
-        prompt = f"""{prompts.get(doc_type, prompts['generic'])}
+        base_prompt = prompts.get(doc_type, prompts['generic'])
+        
+        prompt = f"""{base_prompt}
 
 DATA:
-{content[:8000]}  # Limit to 8K chars to avoid token limits
+{content[:GEMINI_PARSE_MAX_CHARS]}  # Leverage Gemini's large context window
 
 CRITICAL RULES:
 1. Dates MUST be in YYYY-MM-DD format
-2. Numeric fields MUST be numbers (not strings)
-3. Use null (not empty string) for missing fields
-4. Do not invent or hallucinate records
-5. Return valid JSON only
+2. Numeric fields MUST be numbers
+3. Use null for missing fields
+4. Return valid JSON only
 """
         
         try:
-            # Use Gemini 2.5 Pro with JSON response mode
             model = genai.GenerativeModel(
                 GEMINI_MODEL,
                 generation_config={
                     "response_mime_type": "application/json",
-                    "temperature": 0.1  # Low temperature for consistency
+                    "temperature": 0.1
                 }
             )
             
@@ -176,11 +115,6 @@ CRITICAL RULES:
             
             logger.info(f"✓ Document parsed successfully using {GEMINI_MODEL}")
             return result
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"✗ JSON decode error from Gemini: {e}")
-            logger.error(f"Raw response: {response.text[:500]}")
-            raise ValueError(f"Failed to parse JSON response from Gemini: {e}")
             
         except Exception as e:
             logger.error(f"✗ Gemini parsing failed: {e}")
@@ -196,154 +130,87 @@ CRITICAL RULES:
     )
     def reason_on_discrepancy(context: str, use_json: bool = True) -> str:
         """
-        AI reasoning for breaks, discrepancies, and ambiguous cases.
+        AI reasoning for breaks.
         
-        This is the ONLY public reasoning entrypoint for the agent layer.
-        
-        Strategy:
-        1. Try OpenAI first (GPT-4o or o1-*) - optimized for reasoning
-        2. Fall back to Gemini 2.5 Pro if OpenAI unavailable/fails
-        
-        Args:
-            context: Detailed context about the discrepancy (trade, break, amounts, etc.)
-            use_json: Whether to enforce JSON response format
-            
-        Returns:
-            AI reasoning response (JSON string if use_json=True, else text)
-            
-        Raises:
-            Exception: If all models fail after retries
+        STRATEGY:
+        1. Attempt Gemini (Primary)
+        2. If Gemini fails AND OpenAI is configured -> Fallback to OpenAI
         """
         logger.info(f"Reasoning on discrepancy (context length: {len(context)} chars)")
         
-        system_prompt = """You are an expert financial reconciliation analyst with deep knowledge of:
-- Trade settlement cycles (T+0, T+1, T+2)
-- Cash management and timing differences
-- Corporate actions (dividends, splits, mergers)
-- FX settlements and currency conversions
-- Break analysis and root cause determination
+        system_prompt = """You are an expert financial reconciliation analyst.
+Analyze the provided trade and cash candidates.
+Identify the best match or explain the break.
+Return JSON with keys: best_match_id (int|null), confidence (float), action (MATCH|REVIEW|ESCALATE), explanation (str)."""
 
-When analyzing discrepancies:
-1. Think step-by-step through the data
-2. Consider timing differences and settlement cycles
-3. Look for corporate actions or FX impacts
-4. Provide specific, actionable recommendations
-5. Express confidence levels (0.0 to 1.0)
+        full_prompt = f"{system_prompt}\n\n{context}"
 
-Be concise but thorough. Focus on root cause and resolution."""
-
-        # Try OpenAI first (optimized for reasoning)
-        if openai_client:
-            try:
-                logger.info(f"Attempting reasoning with OpenAI ({OPENAI_MODEL})")
-                
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": context}
-                ]
-                
-                kwargs = {
-                    "model": OPENAI_MODEL,
-                    "messages": messages,
-                    "temperature": 0.2  # Low but not zero for reasoning
-                }
-                
-                if use_json:
-                    kwargs["response_format"] = {"type": "json_object"}
-                
-                response = openai_client.chat.completions.create(**kwargs)
-                result = response.choices[0].message.content
-                
-                logger.info(f"✓ Reasoning completed successfully using OpenAI ({OPENAI_MODEL})")
-                return result
-                
-            except Exception as e:
-                logger.warning(f"⚠ OpenAI reasoning failed: {e}. Falling back to Gemini.")
-        
-        # Fallback to Gemini 2.5 Pro
+        # --- STRATEGY 1: GEMINI (PRIMARY) ---
         try:
-            logger.info(f"Attempting reasoning with Gemini ({GEMINI_MODEL})")
+            logger.info(f"Attempting reasoning with PRIMARY: {GEMINI_MODEL}")
             
             config = {"temperature": 0.2}
             if use_json:
                 config["response_mime_type"] = "application/json"
             
             model = genai.GenerativeModel(GEMINI_MODEL, generation_config=config)
-            
-            full_prompt = f"{system_prompt}\n\n{context}"
             response = model.generate_content(full_prompt)
             
-            logger.info(f"✓ Reasoning completed successfully using Gemini ({GEMINI_MODEL})")
+            logger.info(f"✓ Reasoning complete via Gemini")
             return response.text
             
-        except Exception as e:
-            logger.error(f"✗ Gemini reasoning failed: {e}")
-            raise
-    
+        except Exception as gemini_err:
+            logger.warning(f"⚠ Gemini reasoning failed: {gemini_err}")
+            
+            # --- STRATEGY 2: OPENAI (FALLBACK) ---
+            if openai_client:
+                logger.info(f"🔄 Activating FALLBACK: {OPENAI_MODEL}")
+                try:
+                    kwargs = {
+                        "model": OPENAI_MODEL,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": context}
+                        ],
+                        "temperature": 0.2
+                    }
+                    
+                    if use_json:
+                        kwargs["response_format"] = {"type": "json_object"}
+                    
+                    response = openai_client.chat.completions.create(**kwargs)
+                    result = response.choices[0].message.content
+                    logger.info(f"✓ Fallback reasoning successful via OpenAI")
+                    return result
+                    
+                except Exception as openai_err:
+                    logger.error(f"✗ Fallback failed: {openai_err}")
+                    raise openai_err  # Raise original error if fallback also dies
+            
+            # If no fallback configured, re-raise Gemini error
+            logger.error("✗ No fallback configured. Propagating Gemini error.")
+            raise gemini_err
+
+    # === Legacy Methods (Routers) ===
     @staticmethod
     def call_gemini_flash(prompt: str) -> Dict[str, Any]:
-        """
-        Legacy method for backward compatibility.
-        Routes to parse_document with generic type.
-        """
-        logger.warning("call_gemini_flash is deprecated. Use parse_document instead.")
         return LLMGateway.parse_document(prompt, doc_type="generic")
     
     @staticmethod
     def call_openai_brain(prompt: str, system_role: str = None) -> Dict[str, Any]:
-        """
-        Legacy method for backward compatibility.
-        Routes to reason_on_discrepancy.
-        """
-        logger.warning("call_openai_brain is deprecated. Use reason_on_discrepancy instead.")
-        
-        if system_role:
-            context = f"{system_role}\n\n{prompt}"
-        else:
-            context = prompt
-        
+        context = f"{system_role}\n\n{prompt}" if system_role else prompt
         result = LLMGateway.reason_on_discrepancy(context, use_json=True)
         try:
             return json.loads(result)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse JSON from legacy call, returning empty dict")
+        except:
             return {}
     
     @staticmethod
     def get_json(prompt: str) -> Dict[str, Any]:
-        """
-        Legacy method for backward compatibility.
-        Routes to parse_document.
-        """
-        logger.warning("get_json is deprecated. Use parse_document instead.")
         return LLMGateway.parse_document(prompt, doc_type="generic")
 
 
-# === Convenience Functions for Direct Use ===
-
 def call_llm(prompt: str, model: str = None, json_mode: bool = True) -> str:
-    """
-    Unified LLM call for agent/reasoning tasks.
-    
-    This is a thin wrapper around reason_on_discrepancy for backward compatibility.
-    New code should use LLMGateway.reason_on_discrepancy directly.
-    
-    Args:
-        prompt: The prompt to send to the LLM
-        model: Model name (ignored, uses configured models)
-        json_mode: Whether to request JSON response
-        
-    Returns:
-        LLM response as string
-    """
-    logger.debug("call_llm invoked (routes to reason_on_discrepancy)")
     return LLMGateway.reason_on_discrepancy(prompt, use_json=json_mode)
 
-
-# === Export Public API ===
-__all__ = [
-    "LLMGateway",
-    "call_llm",
-    "GEMINI_MODEL",
-    "OPENAI_MODEL"
-]
+__all__ = ["LLMGateway", "call_llm", "GEMINI_MODEL", "OPENAI_MODEL"]

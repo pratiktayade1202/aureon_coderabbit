@@ -1,235 +1,200 @@
 // src/components/BreakDrawer.jsx
-import React, { useState, useEffect } from "react";
-import { AnimatePresence, motion } from "framer-motion";
-import { X, AlertTriangle, CheckCircle2, BrainCircuit, Loader2, Wrench } from "lucide-react";
-import { useAureonApi } from "../hooks/useAureonApi";
+import React from 'react';
+import { 
+  X, Check, AlertTriangle, BrainCircuit, ArrowRight, 
+  Hash, Calendar, DollarSign, Activity, FileText, Scale
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
 
-const BreakDrawer = ({ isOpen, onClose, trade, onSuccess }) => {
-  const api = useAureonApi();
-  const [analysis, setAnalysis] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [isApplying, setIsApplying] = useState(false);
-  const [note, setNote] = useState("");
+const BreakDrawer = ({ isOpen, onClose, breakItem, onResolve }) => {
+  if (!isOpen || !breakItem) return null;
 
-  // 1. Fetch Analysis on Open
-  useEffect(() => {
-    if (isOpen && trade) {
-      setLoading(true);
-      setAnalysis(null);
-      setNote("");
-      
-      api.getBreakAnalysis(trade.id)
-        .then(data => setAnalysis(data))
-        .catch(err => console.error("Analysis failed", err))
-        .finally(() => setLoading(false));
-    }
-  }, [isOpen, trade]);
-
-  if (!isOpen || !trade) return null;
-
-  const handleApply = async () => {
-    setIsApplying(true);
-    try {
-      let defaultNote = "Manual Resolve";
-      let cashId = null;
-      if (analysis?.found && analysis?.best_candidate) {
-        defaultNote = `Matched with Cash ID ${analysis.best_candidate.id} (${analysis.ai_suggestion.explanation})`;
-        cashId = analysis.best_candidate.id;
-      } else {
-        defaultNote = "Manual Force Resolve - No matching cash linked.";
-      }
-
-      const payload = {
-        note: (note && note.trim().length > 0) ? note.trim() : defaultNote,
-        cashId,
-      };
-
-      await api.manualResolve(trade.id, payload);
-      
-      if (onSuccess) onSuccess();
-      onClose();
-    } catch (e) {
-      alert("Failed to apply match: " + e.message);
-    } finally {
-      setIsApplying(false);
-    }
-  };
-
-  // Determine UI State
-  const matchFound = analysis?.found && analysis?.best_candidate;
-  const confidence = analysis?.ai_suggestion?.confidence || 0;
+  // Safe access
+  const trade = breakItem.trade || {};
+  const candidate = breakItem.candidate || {};
   
-  let confColor = "bg-slate-100 text-slate-600";
-  if (confidence > 0.9) confColor = "bg-emerald-100 text-emerald-700";
-  else if (confidence > 0.5) confColor = "bg-amber-100 text-amber-700";
+  // AI Parsing
+  const isAiResolved = breakItem.resolution_type === 'AI' || (breakItem.resolution_note && breakItem.resolution_note.startsWith("AI"));
+  const aiReasoning = breakItem.resolution_note || "Analysis pending...";
+  
+  // Diff Calculation
+  const tradeAmt = Math.abs(trade.amount || 0);
+  const cashAmt = Math.abs(candidate.amount || 0);
+  const diff = Math.abs(tradeAmt - cashAmt);
+  const isPerfectMatch = diff < 0.01;
+
+  // Render Helpers
+  const formatCurrency = (val) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(val);
+  const formatDate = (val) => val ? new Date(val).toLocaleDateString('en-GB') : '-';
 
   return (
-    <AnimatePresence>
-      <div className="fixed inset-0 z-[50] flex justify-end">
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 0.4 }}
-          exit={{ opacity: 0 }}
-          className="absolute inset-0 bg-slate-900 backdrop-blur-[2px]"
-          onClick={onClose}
-        />
+    <>
+      {/* Backdrop */}
+      <div 
+        className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-40" 
+        onClick={onClose}
+      />
 
-        <motion.aside
-          initial={{ x: "100%" }}
-          animate={{ x: 0 }}
-          exit={{ x: "100%" }}
-          transition={{ type: "spring", stiffness: 350, damping: 30 }}
-          className="relative h-[100dvh] w-full max-w-md bg-white shadow-2xl flex flex-col border-l border-slate-200"
-        >
-          {/* Header */}
-          <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-white z-10">
-            <div>
-              <h2 className="text-sm font-bold text-slate-900 uppercase tracking-wide flex items-center gap-2">
-                <AlertTriangle size={16} className="text-amber-500" />
-                Break Resolution
-              </h2>
-              <p className="text-[11px] text-slate-500 mt-0.5 font-mono">
-                Trade ID: {trade.id}
-              </p>
-            </div>
-            <button
-              onClick={onClose}
-              className="p-2 hover:bg-slate-100 rounded-full transition-colors text-slate-400 hover:text-slate-600"
-            >
-              <X size={18} />
-            </button>
-          </div>
-
-          {/* Content */}
-          <div className="flex-1 overflow-y-auto bg-slate-50/50 p-6 space-y-6">
-            
-            {/* Trade Details */}
-            <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-sm">
-              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                Unsettled Trade
+      {/* Drawer Panel */}
+      <motion.div 
+        initial={{ x: "100%" }}
+        animate={{ x: 0 }}
+        exit={{ x: "100%" }}
+        transition={{ type: "spring", stiffness: 300, damping: 30 }}
+        className="fixed inset-y-0 right-0 w-full max-w-xl bg-white shadow-2xl z-50 flex flex-col border-l border-slate-200"
+      >
+        
+        {/* --- 1. HEADER (Dark Terminal Style) --- */}
+        <div className="bg-slate-900 text-white p-5 flex justify-between items-start shrink-0">
+          <div>
+            <div className="flex items-center gap-3 mb-2">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-400 bg-slate-800 px-2 py-0.5 rounded">
+                ID: #{breakItem.id}
               </span>
-              <div className="mt-2 flex justify-between items-start">
-                <div>
-                  <div className="text-sm font-semibold text-slate-900">
-                    {trade.security || trade.symbol}
-                  </div>
-                  <div className="text-[11px] text-slate-500 mt-0.5">
-                    {trade.side} • Qty: {trade.quantity}
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className="font-mono text-sm font-medium text-slate-900">
-                    {Number(trade.amount).toLocaleString()}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Analysis Section */}
-            <div className="relative">
-              <div className="flex items-center gap-2 mb-3">
-                <BrainCircuit size={14} className="text-aureon-blue" />
-                <span className="text-xs font-bold text-slate-700 uppercase">
-                  Match Candidate
+              {isAiResolved && (
+                <span className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-widest text-[#D4AF37] bg-[#D4AF37]/10 px-2 py-0.5 rounded border border-[#D4AF37]/20">
+                  <BrainCircuit size={10} /> AI_PROPOSAL
                 </span>
-              </div>
-
-              {loading ? (
-                <div className="h-32 flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-lg bg-slate-50">
-                  <Loader2 size={20} className="animate-spin text-aureon-blue mb-2" />
-                  <span className="text-xs text-slate-500">Searching Ledger...</span>
-                </div>
-              ) : matchFound ? (
-                <div className="bg-white border border-aureon-blue/30 rounded-lg p-4 shadow-sm ring-1 ring-aureon-blue/10">
-                  <div className="flex justify-between items-start mb-2">
-                    <span className="text-[10px] font-bold text-aureon-blue uppercase tracking-wider">
-                      Recommended Match
-                    </span>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${confColor}`}>
-                      {(confidence * 100).toFixed(0)}% Match
-                    </span>
-                  </div>
-                  
-                  <div className="flex justify-between items-center group cursor-default">
-                    <div className="flex-1 min-w-0">
-                      <div className="text-xs font-medium text-slate-800 truncate">
-                        {analysis.best_candidate.description}
-                      </div>
-                      <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                        Txn ID: {analysis.best_candidate.id} • {analysis.best_candidate.date}
-                      </div>
-                    </div>
-                    <div className="ml-3 text-right">
-                      <div className="font-mono text-xs font-bold text-slate-900">
-                        {Number(analysis.best_candidate.amount).toLocaleString()}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="bg-amber-50 border border-amber-100 rounded-lg p-4 text-center">
-                  <p className="text-xs text-amber-800 font-medium">
-                    No automatic match found.
-                  </p>
-                  <p className="text-[10px] text-amber-600 mt-1">
-                    You can force-resolve this break manually below.
-                  </p>
-                </div>
               )}
             </div>
+            <h2 className="text-lg font-bold tracking-tight flex items-center gap-2">
+              <Activity size={18} className="text-slate-400" />
+              {breakItem.break_type || "Trade Break Analysis"}
+            </h2>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-slate-800 rounded-full transition-colors text-slate-400 hover:text-white">
+            <X size={20} />
+          </button>
+        </div>
 
-            {/* Note Input */}
-            <div className="bg-white border border-slate-200 rounded-lg p-4 shadow-sm">
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                  Resolution Note
+        {/* --- 2. SCROLLABLE CONTENT --- */}
+        <div className="flex-1 overflow-y-auto bg-slate-50 p-6 space-y-6">
+          
+          {/* A. AI INSIGHT (Terminal Block) */}
+          {(isAiResolved || breakItem.resolution_note) && (
+            <div className="bg-black rounded-lg border border-slate-800 overflow-hidden shadow-sm">
+              <div className="bg-slate-800/50 px-4 py-1.5 flex justify-between items-center border-b border-slate-800">
+                <span className="text-[10px] font-mono uppercase text-slate-400 flex items-center gap-1.5">
+                  <BrainCircuit size={10} /> Neural_Cortex_v2.1
                 </span>
-                <span className="text-[10px] text-slate-400">
-                  Optional
-                </span>
+                <span className="text-[10px] font-mono text-green-500">CONFIDENCE: HIGH</span>
               </div>
-              <textarea
-                className="w-full h-24 text-sm font-mono border border-slate-200 rounded-md p-2 focus:outline-none focus:ring-2 focus:ring-slate-900/30 resize-none"
-                placeholder="Explain why this break was resolved or matched."
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-              />
+              <div className="p-4 font-mono text-xs leading-relaxed text-gray-300">
+                <span className="text-green-500 mr-2">root@aureon:~$</span>
+                {aiReasoning}
+                <span className="animate-pulse inline-block w-1.5 h-3 bg-green-500 ml-1 align-middle"/>
+              </div>
+            </div>
+          )}
+
+          {/* B. THE COMPARISON ENGINE */}
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="grid grid-cols-2 bg-slate-50 border-b border-slate-200 text-[10px] font-bold uppercase tracking-widest text-slate-500 py-2 px-4">
+              <div>Broker Ledger</div>
+              <div>Bank Statement</div>
+            </div>
+
+            {/* Row 1: Symbol / Desc */}
+            <div className="grid grid-cols-2 border-b border-slate-100 divide-x divide-slate-100">
+              <div className="p-4">
+                <label className="text-[10px] text-slate-400 font-mono block mb-1">SYMBOL</label>
+                <div className="font-bold text-sm text-slate-900">{trade.symbol}</div>
+                <div className="text-xs text-slate-500 font-mono mt-0.5">{trade.isin || "NO_ISIN"}</div>
+              </div>
+              <div className="p-4 bg-slate-50/50">
+                <label className="text-[10px] text-slate-400 font-mono block mb-1">NARRATION</label>
+                <div className="font-medium text-xs text-slate-700 leading-snug font-mono break-all">
+                  {candidate.description || "NO MATCH CANDIDATE"}
+                </div>
+              </div>
+            </div>
+
+            {/* Row 2: Amounts (The Critical Part) */}
+            <div className="grid grid-cols-2 divide-x divide-slate-100 relative">
+              <div className="p-4">
+                 <label className="text-[10px] text-slate-400 font-mono block mb-1">AMOUNT</label>
+                 <div className="text-lg font-bold font-mono text-slate-900">
+                    {formatCurrency(tradeAmt)}
+                 </div>
+              </div>
+              <div className="p-4 relative">
+                 <label className="text-[10px] text-slate-400 font-mono block mb-1">MATCH AMOUNT</label>
+                 <div className={`text-lg font-bold font-mono ${!candidate.id ? 'text-slate-300' : 'text-slate-900'}`}>
+                    {candidate.id ? formatCurrency(cashAmt) : "---"}
+                 </div>
+                 
+                 {/* Visual Connector for Diff */}
+                 {candidate.id && !isPerfectMatch && (
+                   <div className="absolute top-1/2 -left-3 -translate-y-1/2 bg-red-100 text-red-700 border border-red-200 px-1.5 py-0.5 rounded text-[10px] font-bold font-mono z-10 shadow-sm">
+                      Δ {formatCurrency(diff)}
+                   </div>
+                 )}
+              </div>
+            </div>
+            
+            {/* Row 3: Dates */}
+            <div className="grid grid-cols-2 border-t border-slate-100 divide-x divide-slate-100">
+               <div className="p-3 flex justify-between items-center">
+                  <span className="text-[10px] text-slate-400 font-mono">DATE</span>
+                  <span className="text-xs font-mono font-medium">{formatDate(trade.date)}</span>
+               </div>
+               <div className="p-3 flex justify-between items-center">
+                  <span className="text-[10px] text-slate-400 font-mono">VAL_DATE</span>
+                  <span className={`text-xs font-mono font-medium ${trade.date !== candidate.date ? 'text-amber-600' : ''}`}>
+                    {formatDate(candidate.date)}
+                  </span>
+               </div>
             </div>
           </div>
 
-          {/* Footer - UNLOCKED BUTTON */}
-          <div className="p-5 border-t border-slate-200 bg-white z-10">
-            <button
-              onClick={handleApply}
-              disabled={isApplying}
-              className={`w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-md text-xs font-bold transition-all
-                ${isApplying
-                  ? "bg-slate-100 text-slate-400 cursor-not-allowed"
-                  : "bg-slate-900 text-white hover:bg-black shadow-md hover:shadow-lg"
-                }`}
+          {/* C. METADATA GRID */}
+          <div className="grid grid-cols-2 gap-3">
+             <div className="p-3 bg-white border border-slate-200 rounded-lg">
+                <div className="flex items-center gap-2 text-slate-400 mb-1">
+                   <Hash size={12} /> <span className="text-[10px] font-bold uppercase">Source File</span>
+                </div>
+                <div className="text-xs font-mono truncate" title={trade.source_file}>
+                  {trade.source_file || "Unknown"}
+                </div>
+             </div>
+             <div className="p-3 bg-white border border-slate-200 rounded-lg">
+                <div className="flex items-center gap-2 text-slate-400 mb-1">
+                   <Scale size={12} /> <span className="text-[10px] font-bold uppercase">Break Type</span>
+                </div>
+                <div className="text-xs font-mono font-medium text-slate-700">
+                  {breakItem.break_type || "UNCLASSIFIED"}
+                </div>
+             </div>
+          </div>
+
+        </div>
+
+        {/* --- 3. FOOTER ACTIONS --- */}
+        <div className="p-5 border-t border-slate-200 bg-white shrink-0 space-y-3">
+          {breakItem.status !== 'MATCHED' ? (
+            <button 
+              onClick={() => onResolve(breakItem.id)}
+              className="w-full py-3.5 bg-slate-900 hover:bg-black text-white text-sm font-bold uppercase tracking-wide rounded-lg shadow-lg hover:shadow-xl transition-all flex items-center justify-center gap-2 group active:scale-[0.98]"
             >
-              {isApplying ? (
-                <>
-                  <Loader2 size={14} className="animate-spin" />
-                  Resolving...
-                </>
-              ) : matchFound ? (
-                <>
-                  <CheckCircle2 size={14} />
-                  Accept Match & Resolve
-                </>
-              ) : (
-                <>
-                  <Wrench size={14} />
-                  Force Manual Resolve
-                </>
-              )}
+              <Check size={16} className="text-[#D4AF37]" />
+              Confirm Resolution
             </button>
-          </div>
+          ) : (
+            <div className="w-full py-3 bg-green-50 border border-green-200 text-green-700 text-sm font-bold uppercase tracking-wide rounded-lg flex items-center justify-center gap-2">
+               <Check size={16} /> Resolved
+            </div>
+          )}
+          
+          <button 
+            onClick={onClose}
+            className="w-full py-3 text-xs font-bold text-slate-400 hover:text-slate-600 uppercase tracking-wide transition-colors"
+          >
+            Dismiss Analysis
+          </button>
+        </div>
 
-        </motion.aside>
-      </div>
-    </AnimatePresence>
+      </motion.div>
+    </>
   );
 };
 

@@ -13,7 +13,7 @@ import AlertsPanel from "./AlertsPanel";
 import AuditLogPanel from "./AuditLogPanel";
 import DangerZonePanel from "./DangerZonePanel";
 
-const SettingsLayout = () => {
+const SettingsLayout = ({ resetDatabase }) => {
   const [active, setActive] = useState("workspace");
   const [showCmdHint, setShowCmdHint] = useState(false);
 
@@ -49,7 +49,7 @@ const SettingsLayout = () => {
       case "audit":
         return <AuditLogPanel />;
       case "danger":
-        return <DangerZonePanel />;
+        return <DangerZonePanel onReset={resetDatabase} />;
       default:
         return <WorkspacePanel />;
     }
@@ -93,14 +93,9 @@ const SettingsLayout = () => {
       <div className="flex gap-4 items-stretch">
         <SettingsSidebar active={active} onSelect={setActive} />
 
-        {/* Active panel + danger zone footer */}
+        {/* Active panel */}
         <div className="flex-1 flex flex-col gap-4">
           {renderPanel()}
-
-          {/* Always keep danger zone tiny and at bottom */}
-          <div className="w-full max-w-lg">
-            <DangerZonePanel />
-          </div>
         </div>
       </div>
 

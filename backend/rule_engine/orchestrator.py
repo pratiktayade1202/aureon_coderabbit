@@ -524,7 +524,11 @@ class ReconOrchestrator:
         CRITICAL: Maps DB models to the specific JSON shape 
         expected by frontend/src/components/DataTable.jsx
         
-        Returns structured status with resolution_type for matched trades.
+        PHASE SEPARATION:
+        - Before Auto Resolve: All trades show as raw UNSETTLED, no resolution metadata
+        - After Auto Resolve: Matched trades show resolution_type, resolution_note, breaks visible
+        
+        Returns structured status with resolution_type only for reconciled trades.
         """
         trades = self.db.query(BrokerTrade).filter(
             BrokerTrade.tenant_id == self.tenant_id
@@ -534,17 +538,30 @@ class ReconOrchestrator:
         for t in trades:
             # Determine display status with full context
             if t.status == "MATCHED":
+                # POST-RECONCILIATION STATE: Show resolution details
                 resolution_type = self._get_resolution_type(t.bank_ref)
                 display_status = {
                     "status": "MATCHED",
                     "resolution_type": resolution_type,
                 }
+                
+                # Extract resolution note
+                resolution_note = None
+                if t.bank_ref and ":" in t.bank_ref:
+                    resolution_note = t.bank_ref.split(":", 1)[1].strip()
+                elif t.bank_ref:
+                    resolution_note = t.bank_ref
+                    
             elif t.status == "UNSETTLED" or t.status is None:
+                # Check if this is PRE or POST reconciliation
+                # POST-reconciliation unsettled trades may have breaks
                 has_break = self.db.query(ReconBreak).filter_by(
                     trade_id=t.id, 
                     status="OPEN"
                 ).first()
+                
                 if has_break:
+                    # POST-RECONCILIATION: This trade was processed but couldn't be matched
                     display_status = {
                         "status": "BREAK",
                         "break_type": has_break.break_type,
@@ -552,16 +569,15 @@ class ReconOrchestrator:
                         "break_id": has_break.id,
                     }
                 else:
+                    # PRE-RECONCILIATION: Raw ingested state (or post-recon but no break)
                     display_status = {"status": "UNSETTLED"}
+                
+                resolution_note = None  # No resolution yet
+                
             else:
+                # Other statuses (unlikely but handle gracefully)
                 display_status = {"status": t.status}
-
-            # Extract resolution note
-            resolution_note = None
-            if t.bank_ref and ":" in t.bank_ref:
-                resolution_note = t.bank_ref.split(":", 1)[1].strip()
-            elif t.bank_ref:
-                resolution_note = t.bank_ref
+                resolution_note = None
 
             results.append({
                 "id": t.id,
@@ -573,8 +589,8 @@ class ReconOrchestrator:
                 "amount": float(to_decimal(t.amount)),
                 "status": display_status,
                 "resolution_type": display_status.get("resolution_type") if isinstance(display_status, dict) else None,
-                "resolution_note": resolution_note,
-                "bank_ref": t.bank_ref,
+                "resolution_note": resolution_note if t.status == "MATCHED" else None,
+                "bank_ref": t.bank_ref if t.status == "MATCHED" else None,  # Only show bank_ref after resolution
                 "currency": t.currency or "INR",
                 "source_file": t.source_file,
             })

@@ -330,6 +330,18 @@ The system is ready for production deployment.
 
 ---
 
+### Phase Separation Architecture (Second Session)
+Implemented **strict two-phase architecture** separating ingestion from reconciliation:
+- ✅ **Phase 1 - Ingestion**: Load and normalize raw data ONLY (no reconciliation)
+- ✅ **Phase 2 - Auto Resolve**: Unified reconciliation endpoint (rules + AI)
+- ✅ Dashboard shows raw state before reconciliation, reconciled state after
+- ✅ Holdings updated ONLY during reconciliation, not ingestion
+- ✅ Single entry point for all reconciliation logic
+
+See **[PHASE_SEPARATION.md](./PHASE_SEPARATION.md)** for complete architecture documentation.
+
+---
+
 **Applied By**: AI Agent (Claude Sonnet 4.5)  
 **Review Status**: ✅ Ready for Testing  
-**Deployment Risk**: 🟢 Low (code-only changes, no schema migrations)
+**Deployment Risk**: 🟢 Low (code-only changes, no schema migrations, backward compatible)

@@ -1,5 +1,5 @@
 // src/components/DataTable.jsx
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -16,6 +16,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Layers,
+  Square,
+  CheckSquare,
 } from "lucide-react";
 
 // Numeric formatters with terminal-like precision
@@ -33,88 +35,90 @@ const formatNumber = (val) => {
   return new Intl.NumberFormat("en-US").format(Number(val));
 };
 
-// Status badge with hard color semantics
+// Status badge with traffic-light confidence for AI matches
 const StatusCell = ({ value, bankRef }) => {
-  // Handle both string format and object format from backend
   let statusStr = "UNSETTLED";
-  let statusType = "unsettled";
-  
+
   if (typeof value === "object" && value !== null) {
     statusStr = value.status || "UNSETTLED";
   } else if (typeof value === "string") {
     statusStr = value;
   }
-  
-  const status = statusStr.toUpperCase();
 
-  // Determine display status based on backend fields
-  // Priority: BREAK > MATCHED (AI/Manual) > UNSETTLED
+  const status = String(statusStr || "UNSETTLED").toUpperCase();
+
+  // 1) Breaks (Red)
   if (status === "BREAK") {
     return (
-      <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-red-50 text-status-danger border border-red-200">
-        <AlertCircle size={11} /> BREAK / ESCALATED
+      <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-red-50 text-red-700 border border-red-200">
+        <AlertCircle size={12} /> ESCALATED
       </span>
     );
   }
 
-  if (status === "MATCHED") {
-    // Check bank_ref to determine if AI or Manual resolution
-    const isAiResolved = bankRef && (
-      bankRef.startsWith("AI Matched") || 
-      bankRef.includes("AI Auto-Resolved")
-    );
-    
-    if (isAiResolved) {
-      return (
-        <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-blue-50 text-aureon-blue border border-blue-200">
-          <CheckCircle2 size={11} /> AI-SETTLED
-        </span>
-      );
-    } else {
-      return (
-        <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-emerald-50 text-status-success border border-emerald-200">
-          <CheckCircle2 size={11} /> SETTLED MANUALLY
-        </span>
-      );
+  // 2) Matches (AI / Manual / Rule)
+  if (status === "MATCHED" || status.includes("SETTLED") || status.includes("MATCH")) {
+    const ref = String(bankRef || "");
+    const refUpper = ref.toUpperCase();
+    const isAi = refUpper.startsWith("AI:") || refUpper.startsWith("AI") || refUpper.includes("AI AUTO-RESOLVED");
+    const isManual = refUpper.startsWith("MANUAL:") || refUpper.includes("MANUAL");
+    const isRule = refUpper.startsWith("RULE:") || refUpper.includes("RULE");
+
+    if (isAi) {
+      // Extract confidence: "AI: ... (conf: 0.95)"
+      let confidence = 0;
+      const match = ref.match(/conf[:\s]+(0\.\d+|1(?:\.0+)?)/i);
+      if (match) confidence = parseFloat(match[1]);
+      const pct = confidence > 0 ? `${(confidence * 100).toFixed(0)}%` : "";
+
+      if (confidence >= 0.9) {
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-800 border border-purple-300">
+            <CheckCircle2 size={12} /> AI MATCH {pct}
+          </span>
+        );
+      } else if (confidence >= 0.8) {
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-purple-50 text-purple-600 border border-purple-200">
+            <CheckCircle2 size={12} /> AI MATCH {pct}
+          </span>
+        );
+      } else {
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+            <AlertCircle size={12} /> LOW CONFIDENCE {pct}
+          </span>
+        );
+      }
     }
+
+    // Manual / Rule match (Green)
+    return (
+      <span
+        className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold border ${
+          isManual
+            ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+            : "bg-green-50 text-green-700 border-green-200"
+        }`}
+      >
+        {isManual ? <Wrench size={12} /> : <CheckCircle2 size={12} />}
+        {isManual ? "MANUAL MATCH" : isRule ? "RULE MATCH" : "MATCHED"}
+      </span>
+    );
   }
 
+  // 3) Unsettled / fallback
   if (status === "UNSETTLED") {
     return (
-      <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-amber-50 text-status-warning border border-amber-200">
-        <Clock size={11} /> UNSETTLED
-      </span>
-    );
-  }
-
-  // Legacy fallback for old string statuses
-  if (
-    status.includes("SETTLED") ||
-    status.includes("MATCH") ||
-    status.includes("STORED")
-  ) {
-    return (
-      <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-emerald-50 text-status-success border border-emerald-200">
-        <CheckCircle2 size={11} /> {status.replace("✅ ", "")}
-      </span>
-    );
-  }
-
-  if (
-    status.includes("BREAK") ||
-    status.includes("FAILED") ||
-    status.includes("MISSING")
-  ) {
-    return (
-      <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-red-50 text-status-danger border border-red-200">
-        <AlertCircle size={11} /> {status}
+      <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-500 border border-slate-200">
+        <Clock size={12} /> UNSETTLED
       </span>
     );
   }
 
   return (
-    <span className="inline-flex items-center gap-1 px-2 py-[2px] rounded-sm text-[10px] font-semibold bg-slate-100 text-ink-muted border border-slate-200">
-      <Clock size={11} /> {status}
+    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-500 border border-slate-200">
+      <Clock size={12} /> {status}
     </span>
   );
 };
@@ -125,10 +129,87 @@ const StatusCell = ({ value, bankRef }) => {
  * - Vertical dividers
  * - Terminal-like typography
  */
-const DataTable = ({ view, reconData, holdingsData, navData, onResolve }) => {
+const DataTable = ({
+  view,
+  reconData,
+  holdingsData,
+  navData,
+  onResolve,
+  onSelectionChange,
+  selectionResetKey,
+}) => {
+  const [rowSelection, setRowSelection] = useState({});
+
+  // Clear selection when switching views or after parent-triggered reset
+  useEffect(() => {
+    setRowSelection({});
+  }, [view, selectionResetKey]);
+
+  // Notify parent when selection changes (Trades view only)
+  useEffect(() => {
+    if (!onSelectionChange) return;
+    if (view !== "Trades") {
+      onSelectionChange([]);
+      return;
+    }
+
+    const selectedIds = Object.keys(rowSelection)
+      .map((k) => parseInt(k, 10))
+      .filter((n) => Number.isFinite(n));
+
+    onSelectionChange(selectedIds);
+  }, [rowSelection, onSelectionChange, view]);
+
   const columns = useMemo(() => {
     if (view === "Trades") {
+      const selectColumn = {
+        id: "select",
+        header: ({ table }) => (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              table.getToggleAllRowsSelectedHandler()(e);
+            }}
+            className="p-1 hover:bg-slate-200 rounded text-slate-500"
+            aria-label="Select all"
+            title="Select all"
+          >
+            {table.getIsAllRowsSelected() ? (
+              <CheckSquare size={14} />
+            ) : (
+              <Square size={14} />
+            )}
+          </button>
+        ),
+        cell: ({ row }) => (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              row.getToggleSelectedHandler()(e);
+            }}
+            className={`p-1 rounded ${
+              row.getIsSelected()
+                ? "text-aureon-blue"
+                : "text-slate-300 hover:text-slate-500"
+            }`}
+            aria-label="Select row"
+            title="Select row"
+          >
+            {row.getIsSelected() ? (
+              <CheckSquare size={14} />
+            ) : (
+              <Square size={14} />
+            )}
+          </button>
+        ),
+        size: 44,
+        enableSorting: false,
+      };
+
       return [
+        selectColumn,
         {
           header: "Status",
           accessorKey: "status",
@@ -389,6 +470,23 @@ const DataTable = ({ view, reconData, holdingsData, navData, onResolve }) => {
   const table = useReactTable({
     data,
     columns,
+    getRowId: (row) => String(row?.id ?? ""),
+    state: {
+      rowSelection,
+    },
+    enableRowSelection:
+      view === "Trades"
+        ? (row) => {
+            const statusObj = row.original?.status;
+            const statusStr =
+              typeof statusObj === "object" && statusObj !== null
+                ? statusObj.status
+                : statusObj;
+            const s = String(statusStr || "").toUpperCase();
+            return !(s === "MATCHED" || s.includes("SETTLED"));
+          }
+        : false,
+    onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
@@ -505,7 +603,9 @@ const DataTable = ({ view, reconData, holdingsData, navData, onResolve }) => {
               table.getRowModel().rows.map((row) => (
                 <tr
                   key={row.id}
-                  className="group hover:bg-slate-50 transition-colors"
+                  className={`group hover:bg-slate-50 transition-colors ${
+                    row.getIsSelected() ? "bg-blue-50/30" : ""
+                  }`}
                 >
                   {row.getVisibleCells().map((cell) => {
                     const align =
