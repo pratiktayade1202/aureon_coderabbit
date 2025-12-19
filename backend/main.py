@@ -7,7 +7,7 @@ import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, APIRouter, Request, status
+from fastapi import FastAPI, APIRouter, Request, status, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -29,6 +29,8 @@ from .rules_api import router as rules_router
 from .learning_api import router as learning_router
 from .health import router as health_router
 from .seed_rules import ensure_rule_definitions_exist
+from .auth import get_current_user
+from .database import get_db
 
 # Initialize logging
 logger = setup_logging(settings.environment)
@@ -230,6 +232,20 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 # --- ROUTER REGISTRATION ---
+# API Gateway Structure: All routes are prefixed with /api/v1
+# 
+# Route Mapping:
+# - /api/v1/ingestion/*     -> ingestion_api.py routes
+# - /api/v1/recon/*         -> recon_api.py routes  
+# - /api/v1/rules/*         -> rules_api.py routes
+# - /api/v1/learned-rules   -> learning_api.py routes
+# - /api/v1/audit-logs      -> learning_api.py routes
+# - /api/v1/system/reset    -> system reset endpoint (frontend expects this path)
+# - /api/v1/health          -> health.py routes
+#
+# Frontend expects nested paths (e.g., /api/v1/ingestion/upload)
+# This structure ensures all backend routes match frontend expectations.
+
 # Create API v1 router
 api_v1 = APIRouter(prefix="/api/v1")
 
@@ -239,6 +255,29 @@ api_v1.include_router(ingestion_router, prefix="/ingestion", tags=["ingestion"])
 api_v1.include_router(recon_router, prefix="/recon", tags=["reconciliation"])
 api_v1.include_router(rules_router, prefix="", tags=["rules"])
 api_v1.include_router(learning_router, prefix="", tags=["learning"])
+
+# System routes (frontend expects /api/v1/system/reset, not /api/v1/recon/system/reset)
+from .recon_api import _reset_tenant_data
+from sqlalchemy.orm import Session
+
+@api_v1.post("/system/reset", tags=["system"])
+def system_reset_endpoint(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """System reset endpoint - matches frontend expectation of /api/v1/system/reset"""
+    try:
+        _reset_tenant_data(db, user_id)
+        db.commit()
+        return {
+            "status": "success",
+            "message": "System reset completed",
+            "tenant_id": user_id
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"System reset failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"System reset failed: {str(e)}")
 
 # Include the main API router
 app.include_router(api_v1)
