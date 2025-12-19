@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     # === Database Configuration (REQUIRED) ===
     database_url: str = Field(..., alias="DATABASE_URL")
     
-    # === Redis Configuration (REQUIRED) ===
-    redis_url: str = Field(..., alias="REDIS_URL")
+    # === Redis Configuration (OPTIONAL) ===
+    redis_url: Optional[str] = Field(default=None, alias="REDIS_URL")
     
     # === AI Services - API Keys ===
     # Gemini is REQUIRED (Primary)
@@ -93,12 +93,12 @@ class Settings(BaseSettings):
     
     @field_validator("redis_url")
     @classmethod
-    def validate_redis_url(cls, v: str) -> str:
-        """Validate Redis URL format."""
-        if not v or not v.startswith("redis://"):
+    def validate_redis_url(cls, v: Optional[str]) -> Optional[str]:
+        """Validate Redis URL format (if provided)."""
+        if v is not None and not v.startswith("redis://"):
             raise ValueError(
                 "REDIS_URL must be a valid Redis connection string "
-                "(e.g., redis://host:port/db)"
+                "(e.g., redis://host:port/db) or None"
             )
         return v
 
@@ -117,6 +117,11 @@ def _initialize_settings() -> Settings:
             logger.info(f"✓ OpenAI Model: {settings.openai_model} (FALLBACK ENABLED)")
         else:
             logger.info("ℹ OpenAI: Disabled (No API Key provided)")
+        
+        if settings.redis_url:
+            logger.info(f"✓ Redis: Configured")
+        else:
+            logger.info("ℹ Redis: Disabled (No REDIS_URL provided)")
             
         return settings
     except Exception as e:
@@ -127,8 +132,10 @@ def _initialize_settings() -> Settings:
         logger.critical("")
         logger.critical("Required environment variables:")
         logger.critical("  - DATABASE_URL")
-        logger.critical("  - REDIS_URL")
         logger.critical("  - GEMINI_API_KEY")
+        logger.critical("")
+        logger.critical("Optional environment variables:")
+        logger.critical("  - REDIS_URL (for caching, optional)")
         logger.critical("=" * 80)
         sys.exit(1)
 
