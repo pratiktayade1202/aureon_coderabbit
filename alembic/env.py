@@ -22,6 +22,15 @@ from backend.models import (
     ReconProposal,
     RuleMemory,
     LearningEvent,
+    # v2.1 Safety Models
+    AuditEvent,
+    ReconciliationRun,
+    ProcessedFile,
+    ReconLock,
+    # v3.0 Glass-Box Ingestion
+    IngestionSession,
+    IngestionContract,
+    IngestionExecution,
 )
 
 # Alembic Config

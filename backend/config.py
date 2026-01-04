@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # === Workers Configuration ===
     workers: int = Field(default=1, alias="WORKERS")
     
+    # === PROPOSAL-ONLY MODE (v2.1) ===
+    # When True, Aureon outputs proposals only - no holdings mutation.
+    # This MUST be True for pilot deployments.
+    # Cannot be overridden per-request - environment-locked.
+    proposal_only_mode: bool = Field(default=True, alias="PROPOSAL_ONLY_MODE")
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

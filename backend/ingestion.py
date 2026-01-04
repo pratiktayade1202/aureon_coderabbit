@@ -148,7 +148,7 @@ def run_data_quality_checks(df: pd.DataFrame, file_type: str, logs: list) -> pd.
             
     return df
 
-def normalize_columns(df: pd.DataFrame, logs: list, mapping_cache: dict = None) -> tuple[pd.DataFrame, dict]:
+def normalize_columns(df: pd.DataFrame, logs: list, mapping_cache: dict = None, enforced_mapping: dict = None) -> tuple[pd.DataFrame, dict]:
     """
     AI-FIRST column normalization with Caching.
     
@@ -156,6 +156,7 @@ def normalize_columns(df: pd.DataFrame, logs: list, mapping_cache: dict = None) 
         df: The dataframe chunk
         logs: Audit log list
         mapping_cache: Dictionary of {old_col: new_col} from previous chunks
+        enforced_mapping: Optional rigorous mapping from Glass-Box Contract (Stage 5)
         
     Returns:
         (normalized_df, updated_mapping_cache)
@@ -167,6 +168,24 @@ def normalize_columns(df: pd.DataFrame, logs: list, mapping_cache: dict = None) 
         return str(x).strip().lower().replace(" ", "_").replace(".", "").replace("/", "_").replace("-", "_")
     
     df.columns = [std(c) for c in df.columns]
+    
+    # --- PHASE 5: GLASS-BOX ENFORCED MAPPING ---
+    if enforced_mapping:
+        # User signed a contract. We MUST obey it.
+        # enforced_mapping keys are expected to be the 'standardized' source column names
+        # or we try to match them.
+        
+        applied_map = {}
+        for src, target in enforced_mapping.items():
+            std_src = std(src)
+            # Try exact match on standardized names
+            if std_src in df.columns:
+                applied_map[std_src] = target
+        
+        if applied_map:
+            df = df.rename(columns=applied_map)
+            df = _apply_logic_patches(df, logs)
+            return df, mapping_cache
     
     # If we have a cached map, use it instantly (Fast Path)
     if mapping_cache:
@@ -424,7 +443,7 @@ def route_and_save(df: pd.DataFrame, filename: str, user_id: str, logs: list, is
 # -------------------------------------------------------------------
 # 4) INTERNAL PROCESSING
 # -------------------------------------------------------------------
-def _process_single_stream(content: bytes, filename: str, user_id: str, logs: list) -> tuple[str, int]:
+def _process_single_stream(content: bytes, filename: str, user_id: str, logs: list, enforced_mapping: dict = None) -> tuple[str, int]:
     """
     Processes a single file stream. Uses Chunking for CSVs.
     
@@ -451,7 +470,7 @@ def _process_single_stream(content: bytes, filename: str, user_id: str, logs: li
                 if chunk_df.empty: continue
                 
                 # 1. Normalize (AI Map runs only on first chunk, then cached)
-                chunk_df, mapping_cache = normalize_columns(chunk_df, logs, mapping_cache)
+                chunk_df, mapping_cache = normalize_columns(chunk_df, logs, mapping_cache, enforced_mapping)
                 
                 # 2. Route & Save (Overwrite logic runs only on first chunk)
                 status = route_and_save(chunk_df, filename, user_id, logs, is_first_chunk)
@@ -481,7 +500,7 @@ def _process_single_stream(content: bytes, filename: str, user_id: str, logs: li
              pass
 
         if not df.empty:
-            df, _ = normalize_columns(df, logs, None)
+            df, _ = normalize_columns(df, logs, None, enforced_mapping)
             row_count = len(df)
             status = route_and_save(df, filename, user_id, logs, is_first_chunk=True)
             return (status, row_count)
@@ -495,10 +514,13 @@ def _process_single_stream(content: bytes, filename: str, user_id: str, logs: li
 # -------------------------------------------------------------------
 # 5) MAIN ENTRYPOINT
 # -------------------------------------------------------------------
-def process_file_content(content: bytes, filename: str, user_id: str) -> dict:
+def process_file_content(content: bytes, filename: str, user_id: str, enforced_mapping: dict = None) -> dict:
     """
     Parse file content (CSV/Excel/PDF) and insert into DB.
     Does NOT commit transaction (caller handles commit).
+    
+    Args:
+        enforced_mapping: If provided (Stage 5), skips AI guessing and applies this map.
     
     Returns:
         dict with keys: status, logs, total_rows
@@ -514,11 +536,11 @@ def process_file_content(content: bytes, filename: str, user_id: str) -> dict:
                 for member in file_list:
                     if member.endswith(('.csv', '.xlsx', '.xls', '.pdf')):
                         with z.open(member) as f:
-                            status, row_count = _process_single_stream(f.read(), member, user_id, logs)
+                            status, row_count = _process_single_stream(f.read(), member, user_id, logs, enforced_mapping)
                             total_rows += row_count
                             processed_count += 1
         else:
-            status, row_count = _process_single_stream(content, filename, user_id, logs)
+            status, row_count = _process_single_stream(content, filename, user_id, logs, enforced_mapping)
             total_rows = row_count
             processed_count = 1
 

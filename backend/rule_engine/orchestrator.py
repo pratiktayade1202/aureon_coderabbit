@@ -255,45 +255,20 @@ class ReconOrchestrator:
                     except Exception as e:
                         logger.error(f"Failed to update match for trade {t_id}: {str(e)}")
         
-        # 3. Fallback: Try to match unmatched trades with available cash
-        # This handles cases where engine returns just a count instead of match details
-        if matched_count == 0 and len(trades_data) > 0 and len(cash_data) > 0:
-            for t_data in trades_data:
-                t_id = t_data.get('id')
-                if t_id in broken_trade_ids or t_id in matched_trade_ids:
-                    continue
-                
-                t_amount = float(t_data.get('amount', 0) or t_data.get('net_amount', 0))
-                
-                # Find matching cash by amount (within tolerance)
-                for c_data in cash_data:
-                    c_id = c_data.get('id')
-                    c_status = c_data.get('status', 'UNUSED')
-                    
-                    if c_status == 'MATCHED':
-                        continue
-                    
-                    c_amount = abs(float(c_data.get('amount', 0)))
-                    
-                    # Match within 0.1% tolerance
-                    if t_amount > 0 and abs(t_amount - c_amount) / t_amount < 0.001:
-                        try:
-                            trade = self.db.query(BrokerTrade).filter_by(id=t_id, tenant_id=self.tenant_id).first()
-                            if trade and trade.status != "MATCHED":
-                                trade.status = "MATCHED"
-                                trade.bank_ref = f"RULE:Matched to Cash {c_id} (Run: {self.run_id})"
-                                matched_trade_ids.add(t_id)  # Track for holdings update
-                                
-                                cash = self.db.query(BankTxn).filter_by(id=c_id, tenant_id=self.tenant_id).first()
-                                if cash:
-                                    cash.status = "MATCHED"
-                                    cash.trade_ref = t_id
-                                
-                                matched_count += 1
-                                c_data['status'] = 'MATCHED'  # Mark as used in our local copy
-                                break
-                        except Exception as e:
-                            logger.error(f"Fallback match error: {str(e)}")
+        # ════════════════════════════════════════════════════════════
+        # LEGACY FALLBACK MATCHER - DELETED (v2.0)
+        # ════════════════════════════════════════════════════════════
+        # The following code has been PERMANENTLY REMOVED:
+        #   - Amount-based hash lookup fallback
+        #   - "if engine returned nothing, try matching by tolerance"
+        #
+        # Rationale: "If nothing matches → BREAK. Pain is information."
+        # The deterministic engine now handles ALL matching via:
+        #   Tier 0 (DQ) → Tier 1 (Invariants) → Tier 2-3 (Scoring)
+        # 
+        # If a trade has no match, a NO_MATCH_FOUND break is created.
+        # This is correct behavior, not a bug.
+        # ════════════════════════════════════════════════════════════
         
         # 4. CRITICAL: Create breaks for ALL remaining unmatched trades
         # This ensures unresolved items are visible in the Breaks UI
@@ -326,9 +301,18 @@ class ReconOrchestrator:
         if unmatched_break_count > 0:
             logger.info(f"Created {unmatched_break_count} breaks for unmatched trades")
 
-        # 5. Update holdings ONLY for trades matched in THIS run
-        # CRITICAL: Do NOT pass broken_trade_ids - pass newly matched trade IDs
-        self._update_holdings_from_matches(matched_trade_ids)
+        # ============================================================
+        # PROPOSAL-ONLY MODE (v2.1)
+        # ============================================================
+        # Holdings are NOT updated here.
+        # Aureon outputs diffs (proposals). It never owns state.
+        # Holdings live in: fund admin, custodian, accounting system.
+        # 
+        # For matched trades, proposals are created and can be:
+        # - Exported via /proposals/export
+        # - Reviewed and approved by a different user (maker-checker)
+        # ============================================================
+        logger.info(f"[PROPOSAL_ONLY_MODE] Skipping holdings mutation. {matched_count} match proposals created.")
         
         # Commit all changes
         self.db.commit()
@@ -376,127 +360,17 @@ class ReconOrchestrator:
             "severity": new_break.severity.value,
         })
 
-    def _update_holdings_from_matches(self, newly_matched_trade_ids: set):
-        """
-        Update holdings based on NEWLY matched trades only.
-        
-        CRITICAL: This function should only be called with the set of trade IDs
-        that were matched in THIS reconciliation run. It should NOT re-process
-        all matched trades, as that would cause incorrect AUC accumulation.
-        
-        Args:
-            newly_matched_trade_ids: Set of trade IDs that were matched in this run
-        """
-        if not newly_matched_trade_ids:
-            logger.debug("No newly matched trades to update holdings for")
-            return
-            
-        try:
-            for trade_id in newly_matched_trade_ids:
-                trade = self.db.query(BrokerTrade).filter_by(
-                    id=trade_id, 
-                    tenant_id=self.tenant_id
-                ).first()
-                
-                if trade:
-                    self._apply_single_trade_to_holdings(trade)
-                    
-        except Exception as e:
-            logger.error(f"Failed to update holdings: {str(e)}")
-
-    def _apply_single_trade_to_holdings(self, trade: BrokerTrade) -> None:
-        """
-        Apply a single trade's position change to holdings.
-        
-        ECONOMIC LOGIC:
-        - BUY trades INCREASE holdings (quantity and value go UP)
-        - SELL trades DECREASE holdings (quantity and value go DOWN)
-        
-        This method should be called ONCE per trade when it's resolved.
-        It handles both creating new holdings and updating existing ones.
-        
-        Args:
-            trade: The BrokerTrade to apply to holdings
-        """
-        try:
-            # Normalize quantity to positive value
-            quantity = abs(to_decimal(trade.quantity))
-            price = to_decimal(trade.price)
-            
-            # Determine sign based on trade side
-            # BUY = +quantity (increase holdings)
-            # SELL = -quantity (decrease holdings)
-            side_upper = (trade.side or "").upper()
-            
-            if side_upper in ['BUY', 'B', 'CREDIT', 'CR', 'PURCHASE']:
-                quantity_change = quantity  # Positive: adds to holdings
-            elif side_upper in ['SELL', 'S', 'DEBIT', 'DR', 'SALE']:
-                quantity_change = -quantity  # Negative: reduces holdings
-            else:
-                # Unknown side - log warning and skip
-                logger.warning(f"Unknown trade side '{trade.side}' for trade {trade.id}, skipping holdings update")
-                return
-            
-            # Calculate value change (same sign as quantity change)
-            value_change = quantity_change * price
-            
-            logger.info(f"Applying trade {trade.id}: {trade.symbol} {trade.side} qty={quantity} @ {price} -> delta={quantity_change}")
-            
-            # Get or create holding for this symbol
-            holding = self.db.query(Holding).filter(
-                Holding.tenant_id == self.tenant_id,
-                Holding.symbol == trade.symbol
-            ).first()
-            
-            if holding:
-                # Update existing holding
-                old_quantity = to_decimal(holding.quantity)
-                new_quantity = old_quantity + quantity_change
-                
-                # Prevent negative holdings (would indicate data issue)
-                if new_quantity < Decimal('0'):
-                    logger.warning(
-                        f"Trade {trade.id} would make {trade.symbol} holdings negative "
-                        f"({old_quantity} + {quantity_change} = {new_quantity}). Clamping to 0."
-                    )
-                    new_quantity = Decimal('0')
-                
-                # Update quantity and total value
-                holding.quantity = float(new_quantity)
-                holding.total_value = float(new_quantity * to_decimal(holding.market_price or price))
-                holding.date = date.today()
-                
-                logger.info(f"Updated holding {trade.symbol}: {old_quantity} -> {new_quantity} (AUC: {holding.total_value})")
-            else:
-                # Create new holding (only for BUY, SELL with no existing holding is unusual)
-                if quantity_change > 0:
-                    holding = Holding(
-                        tenant_id=self.tenant_id,
-                        date=date.today(),
-                        symbol=trade.symbol,
-                        isin=trade.isin,
-                        quantity=float(quantity_change),
-                        avg_cost=float(price),
-                        market_price=float(price),
-                        total_value=float(value_change),
-                        source_file=trade.source_file,
-                    )
-                    self.db.add(holding)
-                    logger.info(f"Created new holding {trade.symbol}: qty={quantity_change}, value={value_change}")
-                else:
-                    logger.warning(f"SELL trade {trade.id} for {trade.symbol} but no existing holding found")
-            
-            # Log the holdings update for audit trail
-            self._log_reconciliation_event("HOLDINGS_UPDATED", {
-                "trade_id": trade.id,
-                "symbol": trade.symbol,
-                "side": trade.side,
-                "quantity_change": float(quantity_change),
-                "value_change": float(value_change),
-            })
-                    
-        except Exception as e:
-            logger.error(f"Failed to apply trade {trade.id} to holdings: {str(e)}")
+    # ============================================================
+    # HOLDINGS MUTATION REMOVED (v2.1 - Proposal-Only Mode)
+    # ============================================================
+    # The following functions have been intentionally deleted:
+    #   - _update_holdings_from_matches()
+    #   - _apply_single_trade_to_holdings()
+    #
+    # Rationale: "Aureon outputs diffs. It never owns state."
+    # Holdings must live in external systems (fund admin, custodian).
+    # This eliminates audit failure modes FM-01, FM-07, FM-09.
+    # ============================================================
 
     def _get_resolution_type(self, bank_ref: str) -> str:
         """

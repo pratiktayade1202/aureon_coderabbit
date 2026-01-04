@@ -1,248 +1,301 @@
 # backend/rule_engine/core/engine.py
+"""
+Hybrid Rule Engine 2.0 - Deterministic Reconciliation Engine.
+
+CRITICAL CHANGE FROM V1:
+- DELETED: _vectorized_match() hash-based matcher
+- NEW: Rule-driven matching via CandidateGenerator
+- Flow: TIER 0 → TIER 1 → CANDIDATE SCORING → AGGREGATION
+
+AI is FORBIDDEN until Tier 4 (not yet implemented).
+"""
 
 import logging
-import pandas as pd
-import numpy as np
 from typing import List, Dict, Any, Optional
-from .registry import RuleRegistry
-from .context import RuleContext
-from .result import RuleResult
-from .aggregator import ResultAggregator
+from datetime import date
 
-# Import Domain Registrars
+from .candidate_generator import CandidateGenerator, ScoredCandidate
+from .config import DEFAULT_THRESHOLDS, DEFAULT_TOLERANCES
+from .registry import RuleRegistry
+from ..tiers import DataQualityGate, HardInvariantChecker
+
+# Import Domain Registrars for backward compatibility with seed_rules
 from ..domains.positions import register_position_rules
 from ..domains.trade_cash import register_trade_cash_rules
 from ..domains.nav import register_nav_rules
 from ..domains.data_quality import register_data_quality_rules
 
+logger = logging.getLogger(__name__)
+
+
 class ReconciliationEngine:
-    def __init__(self):
+    """
+    Deterministic Rule Engine 2.0.
+    
+    Flow:
+    1. TIER 0: Data Quality gates on all records
+    2. For each trade: Generate candidates from cash pool
+    3. TIER 1-3: Score candidates (invariants → tolerances → temporal)
+    4. AGGREGATION: Pick best candidate, decide MATCH/REVIEW/BREAK
+    5. OUTPUT: Full audit trail with rule scores
+    
+    NO AI. NO FALLBACKS. NO RETRIES.
+    If nothing matches → BREAK.
+    """
+    
+    def __init__(self, thresholds=None, tolerances=None):
+        self.thresholds = thresholds or DEFAULT_THRESHOLDS
+        self.tolerances = tolerances or DEFAULT_TOLERANCES
+        self.candidate_generator = CandidateGenerator(self.thresholds, self.tolerances)
         self.registry = RuleRegistry
         self.is_initialized = False
-
+        logger.info("ReconciliationEngine 2.0 initialized (DETERMINISTIC ONLY)")
+    
     def initialize(self):
-        if self.is_initialized: return
+        """
+        Initialize legacy rule registry for backward compatibility.
+        This is used by seed_rules.py to populate the database with rule definitions.
+        """
+        if self.is_initialized:
+            return
+        
         print("🚀 Aureon Engine: Initializing Rule Domains...")
         register_position_rules()
         register_trade_cash_rules()
         register_nav_rules()
-        register_data_quality_rules()  # NEW: Stress test detection rules
+        register_data_quality_rules()
         self.is_initialized = True
         print(f"✅ Engine Ready. {len(self.registry.get_all())} rules loaded.")
-
-    def _vectorized_match(self, df_trades: pd.DataFrame, df_cash: pd.DataFrame) -> Dict[int, Optional[int]]:
+    
+    def run(self, trades: List[Dict], cash_entries: List[Dict], 
+            metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """
-        Fast matcher for trade↔cash pairing.
-
-        Goals:
-        - Avoid Python nested loops (O(N×M) in Python).
-        - Preserve existing semantics:
-          - Currency must match *if trade currency is present*
-          - Amount match within tolerance: max(1.0, 1% of trade amount)
-          - One cash row can only be used once (greedy, trade-order deterministic)
-
-        Approach:
-        1) Exact matches first (hashed lookup) using rounded amounts (2dp).
-        2) Remaining matches via per-currency sorted arrays + binary search, only scanning
-           candidates within tolerance (numpy vector ops), for ~O(N log M).
+        Run deterministic reconciliation.
+        
+        Args:
+            trades: List of trade dicts
+            cash_entries: List of cash transaction dicts
+            metadata: Optional metadata (tenant_id, run_date, etc.)
+            
+        Returns:
+            Report with matches, breaks, and full audit trail
         """
-        n_trades = len(df_trades)
-        n_cash = len(df_cash)
-
-        if n_trades == 0:
-            return {}
-        if n_cash == 0:
-            return {i: None for i in range(n_trades)}
-
-        # --- Normalize / extract columns (vectorized) ---
-        df_trades = df_trades.copy()
-        df_cash = df_cash.copy()
-
-        if "net_amount" in df_trades.columns:
-            df_trades["_trade_amount"] = pd.to_numeric(df_trades["net_amount"], errors="coerce").fillna(0.0).astype(float)
-        elif "amount" in df_trades.columns:
-            df_trades["_trade_amount"] = pd.to_numeric(df_trades["amount"], errors="coerce").fillna(0.0).astype(float)
-        else:
-            df_trades["_trade_amount"] = 0.0
-
-        if "amount" in df_cash.columns:
-            df_cash["_cash_amount"] = pd.to_numeric(df_cash["amount"], errors="coerce").fillna(0.0).astype(float)
-        else:
-            df_cash["_cash_amount"] = 0.0
-
-        # IMPORTANT: mimic old behavior:
-        # - If trade currency missing/blank => allow any currency
-        # - If cash currency missing => default INR
-        if "currency" in df_trades.columns:
-            df_trades["_trade_currency"] = df_trades["currency"].fillna("").astype(str).str.upper().str.strip()
-        else:
-            df_trades["_trade_currency"] = ""
-
-        if "currency" in df_cash.columns:
-            df_cash["_cash_currency"] = df_cash["currency"].fillna("INR").astype(str).str.upper().str.strip()
-        else:
-            df_cash["_cash_currency"] = "INR"
-
-        trade_amt = df_trades["_trade_amount"].to_numpy(dtype=float, copy=False)
-        trade_ccy = df_trades["_trade_currency"].to_numpy(dtype=object, copy=False)
-        cash_amt = df_cash["_cash_amount"].to_numpy(dtype=float, copy=False)
-        cash_ccy = df_cash["_cash_currency"].to_numpy(dtype=object, copy=False)
-
-        matches: Dict[int, Optional[int]] = {i: None for i in range(n_trades)}
-        used_cash = np.zeros(n_cash, dtype=bool)
-
-        # --- 1) Exact match pass (hash lookup) ---
-        # Use 2dp rounding to avoid float representation surprises.
-        trade_amt_key = np.round(trade_amt, 2)
-        cash_amt_key = np.round(cash_amt, 2)
-
-        from collections import defaultdict, deque
-
-        exact_by_ccy: Dict[tuple[str, float], deque[int]] = defaultdict(deque)
-        exact_any_ccy: Dict[float, deque[int]] = defaultdict(deque)
-
-        for j in range(n_cash):
-            ccy = cash_ccy[j] or "INR"
-            key_amt = float(cash_amt_key[j])
-            exact_by_ccy[(ccy, key_amt)].append(j)
-            exact_any_ccy[key_amt].append(j)
-
-        for i in range(n_trades):
-            ccy = trade_ccy[i]
-            key_amt = float(trade_amt_key[i])
-
-            if ccy:
-                dq = exact_by_ccy.get((ccy, key_amt))
-            else:
-                dq = exact_any_ccy.get(key_amt)
-
-            if not dq:
-                continue
-
-            while dq and used_cash[dq[0]]:
-                dq.popleft()
-            if dq:
-                j = dq.popleft()
-                used_cash[j] = True
-                matches[i] = int(j)
-
-        # --- 2) Tolerance pass (binary search within currency buckets) ---
-        # Build sorted cash arrays for remaining rows, per currency and "ANY".
-        remaining_idx = np.flatnonzero(~used_cash)
-        if remaining_idx.size == 0:
-            return matches
-
-        cash_by_ccy: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        # Currency-specific buckets
-        for ccy in np.unique(cash_ccy[remaining_idx]):
-            idxs = remaining_idx[cash_ccy[remaining_idx] == ccy]
-            if idxs.size == 0:
-                continue
-            amts = cash_amt[idxs]
-            order = np.argsort(amts, kind="mergesort")  # stable
-            cash_by_ccy[str(ccy)] = (amts[order], idxs[order])
-
-        # "ANY currency" bucket for trades with missing currency
-        any_amts = cash_amt[remaining_idx]
-        any_order = np.argsort(any_amts, kind="mergesort")
-        cash_any = (any_amts[any_order], remaining_idx[any_order])
-
-        for i in range(n_trades):
-            if matches[i] is not None:
-                continue
-
-            amt = float(trade_amt[i])
-            tol = max(1.0, abs(amt) * 0.01)
-            ccy = trade_ccy[i]
-
-            if ccy and str(ccy) in cash_by_ccy:
-                amts_sorted, idxs_sorted = cash_by_ccy[str(ccy)]
-            else:
-                amts_sorted, idxs_sorted = cash_any
-
-            if amts_sorted.size == 0:
-                continue
-
-            lo = np.searchsorted(amts_sorted, amt - tol, side="left")
-            hi = np.searchsorted(amts_sorted, amt + tol, side="right")
-            if lo >= hi:
-                continue
-
-            cand_amts = amts_sorted[lo:hi]
-            cand_idxs = idxs_sorted[lo:hi]
-
-            # Filter out already-used cash rows
-            unused_mask = ~used_cash[cand_idxs]
-            if not unused_mask.any():
-                continue
-
-            diffs = np.abs(cand_amts - amt)
-            diffs = np.where(unused_mask, diffs, np.inf)
-            k = int(np.argmin(diffs))
-            if not np.isfinite(diffs[k]):
-                continue
-
-            j = int(cand_idxs[k])
-            used_cash[j] = True
-            matches[i] = j
-
-        return matches
-
-    def run(self, dataset_a: List[Dict], dataset_b: List[Dict], metadata: Dict[str, Any] = None) -> Dict[str, Any]:
-        if not self.is_initialized: self.initialize()
+        run_id = (metadata or {}).get("run_id", "unknown")
         
-        context = RuleContext(metadata=metadata)
-        results: List[RuleResult] = []
+        logger.info(f"=" * 60)
+        logger.info(f"[ENGINE] Starting reconciliation run {run_id}")
+        logger.info(f"[ENGINE] Trades: {len(trades)}, Cash: {len(cash_entries)}")
+        logger.info(f"[ENGINE] Thresholds: auto_match={self.thresholds.auto_match}, review={self.thresholds.review_floor}")
+        logger.info(f"=" * 60)
         
-        print(f"⚙️  Intelligent Matching: {len(dataset_a)} Trades vs {len(dataset_b)} Cash entries...")
-
-        # ✅ FAST: Convert to DataFrames for vectorized operations
-        # Reset index to ensure sequential 0-based indices matching list positions
-        df_trades = pd.DataFrame(dataset_a).reset_index(drop=True)
-        df_cash = pd.DataFrame(dataset_b).reset_index(drop=True)
+        # Results tracking
+        matches = []
+        reviews = []
+        breaks = []
+        trade_results = {}
         
-        # ✅ FAST: Vectorized matching (replaces O(N×M) nested loops)
-        matches = self._vectorized_match(df_trades, df_cash)
+        # Track consumed cash to prevent double-matching
+        consumed_cash_ids = set()
         
-        active_rules = self.registry.get_all()
-
-        # Iterate through TRADES (Dataset A) - still needed for rule execution
-        # Use enumerate to get list position, which matches DataFrame index after reset_index
-        for trade_idx, trade in enumerate(dataset_a):
+        # ─────────────────────────────────────────────────────────
+        # PHASE 1: TIER 0 - Data Quality Gate (ALL Records)
+        # ─────────────────────────────────────────────────────────
+        valid_trades = []
+        valid_cash = []
+        
+        for trade in trades:
+            trade_id = trade.get("id")
+            dq_results = DataQualityGate.run_all(trade, "trade")
+            dq_passed = all(r.passed for r in dq_results)
             
-            # 1. Get the matched CASH entry (from vectorized matching)
-            cash_idx = matches.get(trade_idx)
-            
-            if cash_idx is not None:
-                cash = dataset_b[cash_idx]
-                match_status = "PROPOSED_MATCH"
+            if not dq_passed:
+                failed_rules = [r for r in dq_results if not r.passed]
+                logger.warning(f"[ENGINE] Trade={trade_id} REJECTED at Tier0 (DQ)")
+                for r in failed_rules:
+                    logger.warning(f"  {r.rule_id}: {r.message}")
+                
+                breaks.append({
+                    "trade_id": trade_id,
+                    "rule_id": failed_rules[0].rule_id,
+                    "break_type": "DATA_QUALITY",
+                    "severity": "CRITICAL",
+                    "message": failed_rules[0].message,
+                    "details": {"id": trade_id}
+                })
             else:
-                cash = {} # Empty dict implies "Missing Cash"
-                match_status = "UNMATCHED"
-
-            # 2. Run Validation Rules on the Pair
-            row_results = {} 
+                valid_trades.append(trade)
+        
+        for cash in cash_entries:
+            cash_id = cash.get("id")
+            dq_results = DataQualityGate.run_all(cash, "cash")
+            dq_passed = all(r.passed for r in dq_results)
             
-            for rule in active_rules:
-                if not rule.should_run(row_results): continue
-
-                try:
-                    # If unmatched, we still run rules. 
-                    # Many rules will fail (e.g. "Exact Amount Match"), identifying the break.
-                    res = rule.execute(trade, cash, context)
-                    
-                    # Pass IDs back to Orchestrator
-                    if 'id' in trade:
-                        res.details['id'] = trade['id']
-                    if 'id' in cash and cash:
-                        res.details['cash_id'] = cash['id']
-                    
-                    # Tag the result with our matching logic status
-                    res.details['match_algorithm'] = match_status
-
-                    row_results[rule.rule_id] = res
-                    results.append(res)
-                except Exception as e:
-                    logging.error(f"Rule {rule.rule_id} crashed: {str(e)}")
-
-        return ResultAggregator.aggregate(results)
+            if dq_passed:
+                valid_cash.append(cash)
+            else:
+                logger.debug(f"[ENGINE] Cash={cash_id} failed DQ, excluded from pool")
+        
+        logger.info(f"[ENGINE] After Tier0: {len(valid_trades)} valid trades, {len(valid_cash)} valid cash")
+        
+        # ─────────────────────────────────────────────────────────
+        # PHASE 2: For each trade, generate and score candidates
+        # ─────────────────────────────────────────────────────────
+        for trade in valid_trades:
+            trade_id = trade.get("id")
+            
+            # Filter out already-consumed cash
+            available_cash = [c for c in valid_cash if c.get("id") not in consumed_cash_ids]
+            
+            # Generate candidates using Tier 1-3 rules
+            candidates = self.candidate_generator.generate_candidates(
+                trade, 
+                available_cash,
+                max_candidates=5
+            )
+            
+            # Log full rule trail
+            self._log_trade_result(trade_id, candidates)
+            
+            if not candidates:
+                # NO CANDIDATES PASSED INVARIANTS → BREAK
+                logger.info(f"[ENGINE] Trade={trade_id} → decision=BREAK (no candidates)")
+                breaks.append({
+                    "trade_id": trade_id,
+                    "rule_id": "NO_MATCH",
+                    "break_type": "NO_CANDIDATES",
+                    "severity": "MEDIUM",
+                    "message": f"No cash entries passed invariant checks",
+                    "amount_diff": float(trade.get("amount", 0)),
+                    "details": {"id": trade_id}
+                })
+                trade_results[trade_id] = {"decision": "BREAK", "reason": "no_candidates"}
+                continue
+            
+            # Best candidate
+            best = candidates[0]
+            
+            if best.decision == "MATCH":
+                # AUTO MATCH (confidence >= 0.95)
+                matches.append({
+                    "trade_id": trade_id,
+                    "cash_id": best.cash_id,
+                    "confidence": best.confidence,
+                    "rule_trail": self._extract_rule_trail(best),
+                })
+                consumed_cash_ids.add(best.cash_id)
+                trade_results[trade_id] = {
+                    "decision": "MATCH", 
+                    "cash_id": best.cash_id,
+                    "confidence": best.confidence
+                }
+                
+            elif best.decision == "REVIEW":
+                # NEEDS HUMAN REVIEW (0.75 <= confidence < 0.95)
+                reviews.append({
+                    "trade_id": trade_id,
+                    "cash_id": best.cash_id,
+                    "confidence": best.confidence,
+                    "rule_trail": self._extract_rule_trail(best),
+                    "alternatives": len(candidates) - 1,
+                })
+                # Don't consume cash for REVIEW - human decides
+                trade_results[trade_id] = {
+                    "decision": "REVIEW",
+                    "cash_id": best.cash_id,
+                    "confidence": best.confidence
+                }
+                
+            else:
+                # BREAK (confidence < 0.75)
+                breaks.append({
+                    "trade_id": trade_id,
+                    "rule_id": "LOW_CONFIDENCE",
+                    "break_type": "CONFIDENCE_BELOW_THRESHOLD",
+                    "severity": "MEDIUM",
+                    "message": f"Best candidate confidence {best.confidence:.3f} below threshold",
+                    "amount_diff": best.aggregated_result.amount_diff if best.aggregated_result else 0,
+                    "details": {"id": trade_id, "best_cash_id": best.cash_id}
+                })
+                trade_results[trade_id] = {
+                    "decision": "BREAK",
+                    "reason": "low_confidence",
+                    "confidence": best.confidence
+                }
+        
+        # ─────────────────────────────────────────────────────────
+        # PHASE 3: Summary Report
+        # ─────────────────────────────────────────────────────────
+        report = {
+            "status": "success",
+            "run_id": run_id,
+            "match_count": len(matches),
+            "review_count": len(reviews),
+            "break_count": len(breaks),
+            "matches": matches,
+            "reviews": reviews,
+            "breaks": breaks,
+            "trade_results": trade_results,
+            "thresholds": {
+                "auto_match": self.thresholds.auto_match,
+                "review_floor": self.thresholds.review_floor,
+            }
+        }
+        
+        logger.info(f"=" * 60)
+        logger.info(f"[ENGINE] Run {run_id} Complete")
+        logger.info(f"[ENGINE] MATCH: {len(matches)} | REVIEW: {len(reviews)} | BREAK: {len(breaks)}")
+        logger.info(f"=" * 60)
+        
+        return report
+    
+    def _log_trade_result(self, trade_id: int, candidates: List[ScoredCandidate]):
+        """Log structured rule execution trace for a trade."""
+        logger.info(f"")
+        logger.info(f"[ENGINE] Trade={trade_id}")
+        
+        if not candidates:
+            logger.info(f"  Candidates=0")
+            logger.info(f"  → decision=BREAK (no candidates passed Tier 0-1)")
+            return
+        
+        best = candidates[0]
+        logger.info(f"  Candidates={len(candidates)}")
+        
+        # Group results by tier
+        tier_results = {}
+        for r in best.rule_results:
+            tier = r.tier
+            if tier not in tier_results:
+                tier_results[tier] = []
+            tier_results[tier].append(r)
+        
+        for tier in sorted(tier_results.keys()):
+            tier_name = {
+                0: "Tier0", 1: "Tier1", 2: "Tier2", 3: "Tier3"
+            }.get(tier, f"Tier{tier}")
+            
+            tier_passed = all(r.passed for r in tier_results[tier])
+            logger.info(f"  {tier_name}={'PASS' if tier_passed else 'FAIL'}")
+            
+            # Log scoring rules with weight > 0
+            for r in tier_results[tier]:
+                if r.weight > 0:
+                    logger.info(f"    {r.rule_id} score={r.score:.2f} weight={r.weight:.2f} | {r.message}")
+        
+        logger.info(f"  → confidence={best.confidence:.3f}")
+        logger.info(f"  → decision={best.decision}")
+    
+    def _extract_rule_trail(self, candidate: ScoredCandidate) -> List[Dict]:
+        """Extract rule trail for audit logging."""
+        trail = []
+        for r in candidate.rule_results:
+            if r.weight > 0:  # Only include scoring rules
+                trail.append({
+                    "rule_id": r.rule_id,
+                    "tier": r.tier,
+                    "score": round(r.score, 3),
+                    "weight": r.weight,
+                    "passed": r.passed,
+                    "message": r.message,
+                })
+        return trail

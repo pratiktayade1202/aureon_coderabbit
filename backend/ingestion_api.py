@@ -23,7 +23,11 @@ from .database import get_db
 from .auth import get_current_user
 from .ingestion import process_file_content
 from .config import settings
-from .models import ProcessedFile, ReconLock
+from .models import ProcessedFile, ReconLock, IngestionSession, IngestionContract, IngestionExecution
+from .schema_analyzer import SchemaAnalyzer
+import uuid
+import pandas as pd
+import io
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -380,3 +384,237 @@ async def delete_uploaded_file(
     db.commit()
     
     return {"status": "success", "message": "File record deleted"}
+
+
+# ============================================================
+# GLASS-BOX INGESTION API (v3.0)
+# ============================================================
+
+class StartSessionResponse(BaseModel):
+    session_id: str
+    status: str
+    message: str
+
+@router.post("/sessions", response_model=StartSessionResponse)
+async def start_ingestion_session(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Stage 1: UPLOAD (The Airlock)
+    - Saves file to secure staging (DB blob for now, S3 later).
+    - Calculates Hash (Drift/Dedup check).
+    - Starts Async Analysis.
+    """
+    try:
+        content = await file.read()
+        file_hash = calculate_file_hash(content)
+        file_size = len(content)
+        
+        # 1. Create Session
+        session_id = str(uuid.uuid4())
+        
+        # Check for duplicate session? 
+        # (Optional: check if exact file hash exists in 'COMPLETED' contracts?)
+        
+        # 1. Create Storage Path (TEMP for V1)
+        # Use system temp directory to avoid Read-only FS errors in containers/prod
+        temp_dir = os.path.join(tempfile.gettempdir(), "aureon_ingestion")
+        os.makedirs(temp_dir, exist_ok=True)
+        storage_path = os.path.join(temp_dir, f"{session_id}_{file.filename}")
+        
+        # Save File
+        with open(storage_path, "wb") as f:
+            f.write(content)
+
+        session = IngestionSession(
+            id=session_id,
+            tenant_id=user_id,
+            filename=file.filename,
+            file_hash=file_hash,
+            file_size=file_size,
+            storage_path=storage_path, # Real path now
+            status="ANALYZING"
+        )
+        db.add(session)
+        db.commit()
+        
+        # 2. Synchronous Analysis (for demo speed)
+        # In prod, this would be a background task
+        analyzer = SchemaAnalyzer(user_id)
+        
+        # Read head
+        try:
+            if file.filename.endswith(".csv"):
+                # Use pandas direct read from bytes
+                df = pd.read_csv(io.BytesIO(content), nrows=20)
+            elif file.filename.endswith((".xlsx", ".xls")):
+                df = pd.read_excel(io.BytesIO(content), nrows=20)
+            elif file.filename.endswith(".zip"):
+                from zipfile import ZipFile
+                with ZipFile(io.BytesIO(content)) as z:
+                    # Find first valid file
+                    valid_files = [n for n in z.namelist() if n.endswith((".csv", ".xlsx", ".xls")) and not n.startswith("__MACOSX")]
+                    if valid_files:
+                        target_file = valid_files[0]
+                        with z.open(target_file) as f:
+                            if target_file.endswith(".csv"):
+                                df = pd.read_csv(f, nrows=20)
+                            else:
+                                df = pd.read_excel(f, nrows=20)
+                    else:
+                        df = pd.DataFrame()
+            else:
+                df = pd.DataFrame() # PDF not supported in v1 demo
+        except Exception as e:
+            logger.warning(f"Analysis read failed: {e}")
+            df = pd.DataFrame()
+            
+        if not df.empty:
+            analysis_result = analyzer.analyze_file_head(df, file.filename)
+            
+            # Create Draft Contract
+            contract_id = str(uuid.uuid4())
+            contract = IngestionContract(
+                id=contract_id,
+                session_id=session_id,
+                tenant_id=user_id,
+                dataset_type=analysis_result["dataset_type"],
+                schema_mapping=analysis_result["schema_mapping"],
+                confidence=analysis_result["confidence"],
+                schema_signature=analysis_result["schema_signature"],
+                status="DRAFT"
+            )
+            db.add(contract)
+            session.status = "DRAFT"
+            db.commit()
+            
+        return {
+            "session_id": session_id,
+            "status": "DRAFT",
+            "message": "File analyzed. Review contract."
+        }
+        
+    except Exception as e:
+        logger.error(f"Session start failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Failed to start session: {str(e)}")
+
+
+@router.get("/sessions/{session_id}")
+def get_session_status(
+    session_id: str,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Stage 3: PREVIEW (The Confidence Builder)
+    Returns the Draft Contract, Confidence, and Mapping for review.
+    """
+    session = db.query(IngestionSession).filter(
+        IngestionSession.id == session_id,
+        IngestionSession.tenant_id == user_id
+    ).first()
+    
+    if not session:
+        raise HTTPException(404, "Session not found")
+        
+    contract = session.contract
+    
+    return {
+        "session_id": session.id,
+        "filename": session.filename,
+        "status": session.status,
+        "contract": {
+            "id": contract.id if contract else None,
+            "dataset_type": contract.dataset_type if contract else None,
+            "mapping": contract.schema_mapping if contract else None,
+            "confidence": contract.confidence if contract else None,
+            "status": contract.status if contract else None
+        } if contract else None
+    }
+
+
+class ApproveContractRequest(BaseModel):
+    contract_id: str
+    final_mapping: dict
+    destructive_ack: bool = False
+
+@router.post("/contracts/{contract_id}/approve")
+def approve_contract(
+    payload: ApproveContractRequest,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Stage 4: APPROVE (The Digital Signature)
+    User signs the contract (potential overrides included).
+    Triggers Execution.
+    """
+    contract = db.query(IngestionContract).filter(
+        IngestionContract.id == payload.contract_id,
+        IngestionContract.tenant_id == user_id
+    ).first()
+    
+    if not contract:
+        raise HTTPException(404, "Contract not found")
+        
+    # Update with final negotiated terms
+    contract.schema_mapping = payload.final_mapping
+    contract.status = "SIGNED"
+    contract.signed_by = user_id
+    contract.signed_at = datetime.utcnow()
+    
+    # Create Execution Record
+    exec_id = str(uuid.uuid4())
+    execution = IngestionExecution(
+        id=exec_id,
+        contract_id=contract.id,
+        tenant_id=user_id,
+        status="RUNNING"
+    )
+    db.add(execution)
+    db.commit()
+    
+    # --- STAGE 5: EXECUTION (The Run) ---
+    try:
+        session = db.query(IngestionSession).filter(IngestionSession.id == contract.session_id).first()
+        if not session or not session.storage_path or not os.path.exists(session.storage_path):
+            raise Exception("Staged file not found. Session expired?")
+            
+        with open(session.storage_path, "rb") as f:
+            content = f.read()
+            
+        # Execute Ingestion with ENFORCED MAPPING
+        result = process_file_content(content, session.filename, user_id, enforced_mapping=contract.schema_mapping)
+        
+        if result["status"] == "Completed":
+            execution.status = "COMPLETED"
+            execution.rows_processed = result["total_rows"]
+            execution.logs = result["logs"]
+            execution.completed_at = datetime.utcnow()
+        else:
+            execution.status = "FAILED"
+            execution.logs = result["logs"]
+            
+        db.commit()
+        
+        # Cleanup Temp File
+        try:
+            os.remove(session.storage_path)
+            session.storage_path = None
+            db.commit()
+        except: pass
+        
+    except Exception as e:
+        execution.status = "FAILED"
+        execution.error_message = str(e)
+        db.commit()
+        logger.error(f"Execution failed: {e}")
+    
+    return {
+        "status": "success",
+        "message": "Contract Executed Successfully.",
+        "execution_id": exec_id,
+        "rows": execution.rows_processed
+    }

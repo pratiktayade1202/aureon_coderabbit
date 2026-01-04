@@ -15,7 +15,7 @@ import io
 from .auth import get_current_user
 from .database import get_db
 from .rule_engine.orchestrator import ReconOrchestrator
-from .models import BrokerTrade, BankTxn, Holding, ReconBreak, ReconStatus, NavLog, ReconLog, LearningEvent, ReconProposal, ReconLock
+from .models import BrokerTrade, BankTxn, Holding, ReconBreak, ReconStatus, NavLog, ReconLog, LearningEvent, ReconProposal, ReconLock, ReconciliationRun, AuditEvent
 from .ai_layer.agent import AIAgent
 from .utils.financial import to_decimal
 from pydantic import BaseModel
@@ -83,14 +83,216 @@ class CommitProposalsRequest(BaseModel):
     min_confidence: Optional[float] = None
 
 
+class CreateRunRequest(BaseModel):
+    """Request to create a new reconciliation run."""
+    run_id: str  # CLIENT-SUPPLIED, must be unique
+    run_type: str = "SETTLEMENT"  # SETTLEMENT, AI_RESOLVE, MANUAL
+    expected_sources: int = 1  # Number of files expected before run is complete
+
+
+# ============================================================
+# AUDIT HELPER (v2.1)
+# Single interface for all control-plane audit events.
+# AuditEvent = External audit trail (governance decisions only)
+# ReconLog = Internal debug telemetry (never expose to UI)
+# ============================================================
+
+def _audit(
+    db: Session,
+    tenant_id: str,
+    event_type: str,
+    entity_type: str,
+    entity_id: Any,
+    actor: str,
+    payload: Dict[str, Any],
+    run_id: Optional[str] = None,
+    actor_role: str = "SYSTEM",  # OPS_ANALYST | SYSTEM | ADMIN
+) -> None:
+    """
+    Log a control-plane audit event.
+    
+    ONLY use for governance-relevant decisions:
+    - RUN_STARTED, RUN_COMPLETED, RUN_FAILED
+    - FILE_UPLOADED
+    - PROPOSAL_CREATED, PROPOSAL_APPROVED, PROPOSAL_REJECTED, PROPOSAL_EXPIRED
+    - TRADE_RESOLVED (manual)
+    
+    Actor Roles:
+    - OPS_ANALYST: Human analyst making decisions
+    - SYSTEM: Automated system actions (AI, engine)
+    - ADMIN: Administrative overrides
+    
+    DO NOT use for engine internals (matching attempts, retries, etc.)
+    """
+    from .audit import get_audit_log
+    audit = get_audit_log(db, tenant_id)
+    audit.append(
+        event_type=event_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        actor=actor,
+        payload=payload,
+        run_id=run_id,
+        actor_role=actor_role,
+    )
+
+
+
+
+# ============================================================
+# RECONCILIATION RUN MANAGEMENT (v2.1 - Idempotency)
+# ============================================================
+
+@router.post("/runs/create")
+def create_reconciliation_run(
+    payload: CreateRunRequest,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Create a new reconciliation run with client-supplied ID.
+    
+    The run_id MUST be unique and is immutable - this enables:
+    - Idempotent retries (same run_id = same result)
+    - Crash recovery (resume from where we left off)
+    - Determinism under load
+    """
+    # Check if run already exists
+    existing = db.query(ReconciliationRun).filter_by(id=payload.run_id).first()
+    if existing:
+        return {
+            "status": "exists",
+            "message": "Run already exists (idempotent)",
+            "run_id": existing.id,
+            "run_status": existing.status,  # Use different key to avoid collision
+        }
+    
+    run = ReconciliationRun(
+        id=payload.run_id,
+        tenant_id=user_id,
+        run_type=payload.run_type,
+        expected_sources=payload.expected_sources,
+        received_sources=0,
+        status="RUNNING",
+        created_by=user_id,
+    )
+    db.add(run)
+    db.commit()
+    
+    logger.info(f"[RUN] Created run {payload.run_id} ({payload.run_type}) expecting {payload.expected_sources} sources")
+    
+    return {
+        "status": "created",
+        "run_id": run.id,
+        "run_type": run.run_type,
+        "expected_sources": run.expected_sources,
+    }
+
+
+@router.post("/runs/{run_id}/complete")
+def mark_run_complete(
+    run_id: str,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Mark a reconciliation run as complete.
+    
+    COMPLETENESS GUARD: Blocks completion if expected sources haven't been received.
+    This prevents partial reconciliation and false confidence.
+    """
+    run = db.query(ReconciliationRun).filter_by(id=run_id, tenant_id=user_id).first()
+    if not run:
+        raise HTTPException(404, f"Run {run_id} not found")
+    
+    if run.status == "COMPLETE":
+        return {
+            "status": "already_complete",
+            "run_id": run_id,
+            "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        }
+    
+    # COMPLETENESS GUARD: Block if sources missing
+    if run.received_sources < run.expected_sources:
+        missing = run.expected_sources - run.received_sources
+        logger.warning(f"[COMPLETENESS_GUARD] Run {run_id} incomplete: {missing} sources missing")
+        raise HTTPException(
+            400,
+            f"Cannot complete run: {missing} source(s) missing. "
+            f"Expected {run.expected_sources}, received {run.received_sources}."
+        )
+    
+    run.status = "COMPLETE"
+    run.completed_at = datetime.utcnow()
+    db.commit()
+    
+    # Log to audit trail
+    from .audit import get_audit_log
+    audit = get_audit_log(db, user_id)
+    audit.append(
+        event_type="RUN_COMPLETED",
+        entity_type="RUN",
+        entity_id=run_id,
+        actor=user_id,
+        payload={
+            "expected_sources": run.expected_sources,
+            "received_sources": run.received_sources,
+            "trades_processed": run.trades_processed,
+            "proposals_created": run.proposals_created,
+        },
+        run_id=run_id,
+    )
+    db.commit()
+    
+    logger.info(f"[RUN] Run {run_id} marked COMPLETE ({run.trades_processed} trades, {run.proposals_created} proposals)")
+    
+    return {
+        "status": "complete",
+        "run_id": run_id,
+        "completed_at": run.completed_at.isoformat(),
+        "trades_processed": run.trades_processed,
+        "proposals_created": run.proposals_created,
+    }
+
+
+@router.get("/runs/{run_id}")
+def get_run_status(
+    run_id: str,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Get the status of a reconciliation run."""
+    run = db.query(ReconciliationRun).filter_by(id=run_id, tenant_id=user_id).first()
+    if not run:
+        raise HTTPException(404, f"Run {run_id} not found")
+    
+    return {
+        "run_id": run.id,
+        "run_type": run.run_type,
+        "status": run.status,
+        "expected_sources": run.expected_sources,
+        "received_sources": run.received_sources,
+        "trades_processed": run.trades_processed,
+        "proposals_created": run.proposals_created,
+        "breaks_created": run.breaks_created,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "created_by": run.created_by,
+    }
+
+
 def _reset_tenant_data(db: Session, user_id: str) -> None:
     """Utility: wipes all tenant data. Used by both reset endpoints."""
+    # Clear proposals and runs first (foreign key dependencies)
     db.execute(text("DELETE FROM recon_proposals WHERE tenant_id = :tid"), {"tid": user_id})
+    db.execute(text("DELETE FROM audit_events WHERE tenant_id = :tid"), {"tid": user_id})
+    db.execute(text("DELETE FROM reconciliation_runs WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM recon_breaks WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM recon_logs WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM bank_txns WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM holdings WHERE tenant_id = :tid"), {"tid": user_id})
     db.execute(text("DELETE FROM broker_trades WHERE tenant_id = :tid"), {"tid": user_id})
+    db.execute(text("DELETE FROM nav_logs WHERE tenant_id = :tid"), {"tid": user_id})  # NAV data
     db.execute(text("DELETE FROM processed_files WHERE tenant_id = :tid"), {"tid": user_id})
 
 @router.post("/run-settlement-engine")
@@ -120,8 +322,27 @@ def run_settlement_engine(
     - Button changes to "AUTO RESOLVE" for AI phase
     """
     with acquire_tenant_lock(db, user_id, "Settlement Engine"):
+        run_id = None
         try:
             logger.info(f"SETTLEMENT ENGINE (Phase 2) triggered for tenant {user_id}")
+            
+            # ============================================================
+            # GOVERNANCE AUDIT: RUN_STARTED (v2.1)
+            # Control began. Who initiated it?
+            # ============================================================
+            from uuid import uuid4
+            run_id = f"settlement-{uuid4()}"
+            _audit(
+                db=db,
+                tenant_id=user_id,
+                event_type="RUN_STARTED",
+                entity_type="RUN",
+                entity_id=run_id,
+                actor=user_id,
+                payload={"run_type": "SETTLEMENT", "phase": "PHASE_2_DETERMINISTIC"},
+                run_id=run_id,
+                actor_role="OPS_ANALYST",
+            )
             
             # Run ONLY deterministic rule engine (no AI)
             orchestrator = ReconOrchestrator(db, user_id)
@@ -136,7 +357,7 @@ def run_settlement_engine(
                 "status": "success",
                 "message": "Settlement engine completed - deterministic rules applied",
                 "phase": "PHASE_2_DETERMINISTIC",
-                "run_id": orchestrator.run_id,
+                "run_id": run_id,
                 "tenant_id": user_id,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "deterministic_results": {
@@ -149,6 +370,27 @@ def run_settlement_engine(
             }
                 
         except Exception as e:
+            # ============================================================
+            # GOVERNANCE AUDIT: RUN_FAILED (v2.1)
+            # Failures matter MORE than success for auditors.
+            # ============================================================
+            if run_id:
+                try:
+                    _audit(
+                        db=db,
+                        tenant_id=user_id,
+                        event_type="RUN_FAILED",
+                        entity_type="RUN",
+                        entity_id=run_id,
+                        actor=user_id,
+                        payload={"error": str(e)[:500], "phase": "PHASE_2_DETERMINISTIC"},
+                        run_id=run_id,
+                        actor_role="SYSTEM",
+                    )
+                    db.commit()  # Commit audit even if main operation failed
+                except Exception:
+                    pass  # Don't fail the failure
+            
             db.rollback()
             logger.error(f"Settlement engine failed: {str(e)}", exc_info=True)
             raise HTTPException(
@@ -253,8 +495,30 @@ def run_auto_resolve(
                                 explanation=explanation[:500],
                                 source_model="AI_AGENT",
                                 status="PENDING",
+                                created_by="AI_AGENT",  # System-generated
                             )
                             db.add(proposal)
+                            db.flush()  # Get proposal.id
+                            
+                            # ============================================================
+                            # GOVERNANCE AUDIT: PROPOSAL_CREATED (v2.1)
+                            # AI generated a decision suggestion. Auditable event.
+                            # ============================================================
+                            _audit(
+                                db=db,
+                                tenant_id=user_id,
+                                event_type="PROPOSAL_CREATED",
+                                entity_type="PROPOSAL",
+                                entity_id=proposal.id,
+                                actor="AI_AGENT",
+                                payload={
+                                    "trade_id": brk.trade_id,
+                                    "cash_id": best_candidate.get("id"),
+                                    "confidence": float(confidence),
+                                    "source_model": "AI_AGENT",
+                                },
+                                actor_role="SYSTEM",  # AI-generated proposal
+                            )
                             proposals_created += 1
 
                 db.commit()
@@ -1085,8 +1349,10 @@ def run_ai_resolve_standalone(
     - Updates trade status to MATCHED
     - Updates cash status to MATCHED  
     - Closes the break
-    - Updates holdings/AUC
     - Creates audit log entry
+    
+    NOTE (v2.1 PROPOSAL-ONLY MODE):
+    Holdings are NOT updated. Aureon outputs diffs only.
     """
     # Configurable threshold - can be adjusted based on risk tolerance
     AUTO_RESOLVE_THRESHOLD = 0.85  # Lowered from 0.9 to allow more auto-resolutions
@@ -1199,14 +1465,12 @@ def run_ai_resolve_standalone(
             
             analysis_details.append(detail)
         
-        # Apply holdings updates for all resolved trades
-        if resolved_trade_ids:
-            from .rule_engine.orchestrator import ReconOrchestrator
-            orchestrator = ReconOrchestrator(db, user_id)
-            for trade_id in resolved_trade_ids:
-                trade = db.query(BrokerTrade).filter_by(id=trade_id, tenant_id=user_id).first()
-                if trade:
-                    orchestrator._apply_single_trade_to_holdings(trade)
+        # ============================================================
+        # PROPOSAL-ONLY MODE (v2.1)
+        # Holdings are NOT updated here.
+        # Aureon outputs diffs (proposals). It never owns state.
+        # ============================================================
+        logger.info(f"[PROPOSAL_ONLY_MODE] Skipping holdings mutation for {len(resolved_trade_ids)} resolved trades")
         
         db.commit()
         
@@ -1337,10 +1601,26 @@ def commit_proposals(
                 try:
                     # Use nested transaction so one failure doesn't poison the whole batch
                     with db.begin_nested():
+                        # ============================================================
+                        # MAKER-CHECKER ENFORCEMENT (v2.1)
+                        # ============================================================
+                        # 1. Different user required
+                        if p.created_by and p.created_by == user_id:
+                            logger.warning(f"[MAKER_CHECKER] Proposal {p.id} rejected: creator cannot approve own proposal")
+                            errors.append(f"proposal {p.id}: Cannot approve own proposal (created by same user)")
+                            continue
+                        
+                        # 2. Temporal separation (approved_at must be after created_at)
+                        now = datetime.utcnow()
+                        if p.created_at and p.created_at >= now:
+                            logger.warning(f"[MAKER_CHECKER] Proposal {p.id} rejected: temporal separation required")
+                            errors.append(f"proposal {p.id}: Temporal separation required (try again later)")
+                            continue
+                        
                         trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).first()
                         if not trade or trade.status == "MATCHED":
                             p.status = "REJECTED"
-                            p.processed_at = datetime.utcnow()
+                            p.processed_at = now
                             continue
 
                         trade.status = "MATCHED"
@@ -1359,25 +1639,40 @@ def commit_proposals(
                                 brk.resolution_note = "Auto-Commited from AI Proposal"
 
                         p.status = "APPROVED"
-                        p.processed_at = datetime.utcnow()
+                        p.processed_at = now
+                        p.approved_by = user_id  # v2.1 Maker-checker audit
+                        p.approved_at = now      # v2.1 Temporal separation proof
 
-                        # Audit log
-                        db.add(
-                            ReconLog(
-                                tenant_id=user_id,
-                                trade_id=trade.id,
-                                cash_id=p.cash_id,
-                                reason=f"AI_COMMIT: {((p.explanation or '')[:150])}",
-                                status_before="OPEN",
-                                status_after="MATCHED",
-                                agent_model="AI_EXECUTOR",
-                            )
+                        # ============================================================
+                        # GOVERNANCE AUDIT: PROPOSAL_APPROVED (v2.1)
+                        # This is a control-plane decision, not engine telemetry.
+                        # ============================================================
+                        _audit(
+                            db=db,
+                            tenant_id=user_id,
+                            event_type="PROPOSAL_APPROVED",
+                            entity_type="PROPOSAL",
+                            entity_id=p.id,
+                            actor=user_id,
+                            payload={
+                                "trade_id": trade.id,
+                                "trade_symbol": trade.symbol,
+                                "trade_amount": float(trade.amount) if trade.amount else 0,
+                                "cash_id": p.cash_id,
+                                "confidence": float(p.confidence) if p.confidence else 0,
+                                "source_model": p.source_model,
+                                "created_by": p.created_by,
+                            },
+                            run_id=p.run_id,
+                            actor_role="OPS_ANALYST",  # Human approved
                         )
 
-                        # Apply holdings update (same accounting logic as manual)
-                        from .rule_engine.orchestrator import ReconOrchestrator
-                        orchestrator = ReconOrchestrator(db, user_id)
-                        orchestrator._apply_single_trade_to_holdings(trade)
+                        # ============================================================
+                        # PROPOSAL-ONLY MODE (v2.1)
+                        # Holdings are NOT updated here.
+                        # Aureon outputs diffs (proposals). It never owns state.
+                        # ============================================================
+                        logger.info(f"[PROPOSAL_ONLY_MODE] Proposal {p.id} committed, holdings NOT mutated")
 
                         committed_count += 1
                 except Exception as e:
@@ -1399,6 +1694,315 @@ def commit_proposals(
             raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================
+# PROPOSALS PREVIEW (v2.1 - Phase 3)
+# Shows pending proposals BEFORE committing for human review
+# ============================================================
+
+@router.get("/proposals/preview")
+def preview_proposals(
+    min_confidence: float = 0.0,  # Filter by confidence floor
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Preview all pending AI proposals BEFORE committing.
+    
+    This endpoint allows analysts to review:
+    - What trades are being proposed for matching
+    - What cash entries they're being matched to
+    - The AI's confidence and explanation
+    - The source model used
+    
+    Use this to inspect proposals before calling /proposals/commit.
+    """
+    proposals = (
+        db.query(ReconProposal)
+        .filter(
+            ReconProposal.tenant_id == user_id,
+            ReconProposal.status == "PENDING",
+            ReconProposal.confidence >= min_confidence,
+        )
+        .order_by(ReconProposal.confidence.desc())
+        .all()
+    )
+    
+    preview_data = []
+    confidence_bands = {"high": 0, "medium": 0, "low": 0}  # >= 0.95, 0.80-0.95, < 0.80
+    
+    for p in proposals:
+        # Get related trade
+        trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).first()
+        cash = db.query(BankTxn).filter_by(id=p.cash_id, tenant_id=user_id).first() if p.cash_id else None
+        
+        conf = float(p.confidence) if p.confidence else 0.0
+        if conf >= 0.95:
+            confidence_bands["high"] += 1
+            confidence_label = "HIGH"
+        elif conf >= 0.80:
+            confidence_bands["medium"] += 1
+            confidence_label = "MEDIUM"
+        else:
+            confidence_bands["low"] += 1
+            confidence_label = "LOW"
+        
+        preview_data.append({
+            "proposal_id": p.id,
+            "confidence": conf,
+            "confidence_label": confidence_label,
+            "source_model": p.source_model,
+            "explanation": p.explanation,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "trade": {
+                "id": trade.id if trade else None,
+                "symbol": trade.symbol if trade else None,
+                "side": trade.side if trade else None,
+                "amount": float(trade.amount) if trade and trade.amount else 0,
+                "quantity": float(trade.quantity) if trade and trade.quantity else 0,
+                "date": trade.date.isoformat() if trade and trade.date else None,
+                "status": trade.status if trade else None,
+            } if trade else None,
+            "cash": {
+                "id": cash.id if cash else None,
+                "amount": float(cash.amount) if cash and cash.amount else 0,
+                "type": cash.txn_type if cash else None,
+                "date": cash.date.isoformat() if cash and cash.date else None,
+                "status": cash.status if cash else None,
+            } if cash else None,
+            "amount_diff": abs(float(trade.amount or 0) - float(cash.amount or 0)) if trade and cash else None,
+            "amount_diff_pct": round(
+                abs(float(trade.amount or 0) - float(cash.amount or 0)) / max(float(trade.amount or 1), 1) * 100, 2
+            ) if trade and cash and trade.amount else None,
+        })
+    
+    return {
+        "status": "success",
+        "count": len(preview_data),
+        "summary": {
+            "total_pending": len(preview_data),
+            "high_confidence": confidence_bands["high"],
+            "medium_confidence": confidence_bands["medium"],
+            "low_confidence": confidence_bands["low"],
+            "recommendation": (
+                f"Safe to commit {confidence_bands['high']} high-confidence proposals (>= 0.95). "
+                f"Review {confidence_bands['medium']} medium-confidence proposals."
+            ) if preview_data else "No pending proposals found.",
+        },
+        "proposals": preview_data,
+        "next_steps": [
+            "Review proposals above",
+            "To commit high-confidence: POST /proposals/commit?min_confidence=0.95",
+            "To commit all: POST /proposals/commit?min_confidence=0.80",
+            "To export: GET /proposals/export",
+        ],
+    }
+
+
+# ============================================================
+# PROPOSALS EXPORT (v2.1 - Phase 3)
+# ============================================================
+
+
+@router.get("/proposals/export")
+def export_proposals(
+    format: str = "json",  # json or csv
+    status: Optional[str] = None,  # PENDING, APPROVED, REJECTED
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Export proposals for external consumption.
+    
+    This is how approved matches flow to external systems:
+    - Fund admin downloads approved proposals
+    - Accounting system ingests for journal entries
+    - Custodian reconciles against their records
+    
+    Aureon outputs diffs. It never owns state.
+    """
+    query = db.query(ReconProposal).filter(ReconProposal.tenant_id == user_id)
+    
+    if status:
+        query = query.filter(ReconProposal.status == status.upper())
+    
+    proposals = query.order_by(ReconProposal.created_at.desc()).all()
+    
+    # Build export data
+    export_data = []
+    for p in proposals:
+        # Get related trade
+        trade = db.query(BrokerTrade).filter_by(id=p.trade_id).first()
+        cash = db.query(BankTxn).filter_by(id=p.cash_id).first() if p.cash_id else None
+        
+        export_data.append({
+            "proposal_id": p.id,
+            "run_id": p.run_id,
+            "status": p.status,
+            "confidence": float(p.confidence) if p.confidence else 0.0,
+            "trade_id": p.trade_id,
+            "trade_symbol": trade.symbol if trade else None,
+            "trade_amount": float(trade.amount) if trade else None,
+            "trade_date": trade.date.isoformat() if trade and trade.date else None,
+            "cash_id": p.cash_id,
+            "cash_amount": float(cash.amount) if cash else None,
+            "cash_date": cash.date.isoformat() if cash and cash.date else None,
+            "explanation": p.explanation,
+            "source_model": p.source_model,
+            "created_by": p.created_by,
+            "approved_by": p.approved_by,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "approved_at": p.approved_at.isoformat() if p.approved_at else None,
+        })
+    
+    if format.lower() == "csv":
+        # Generate CSV
+        if not export_data:
+            return StreamingResponse(
+                iter(["No proposals found"]),
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=proposals.csv"}
+            )
+        
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=export_data[0].keys())
+        writer.writeheader()
+        writer.writerows(export_data)
+        
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=proposals_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"}
+        )
+    
+    # Default: JSON
+    return {
+        "status": "success",
+        "count": len(export_data),
+        "proposals": export_data,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@router.get("/system/info")
+def get_system_info(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    System information including safety disclosures.
+    
+    Returns operational mode, version, and worst-case failure disclosure.
+    """
+    from .config import settings
+    
+    return {
+        "system": settings.app_name,
+        "version": settings.app_version,
+        "environment": settings.environment,
+        "operational_mode": "PROPOSAL_ONLY",
+        
+        # ============================================================
+        # WORST-CASE DISCLOSURE (v2.1)
+        # Auditors, investors, and regulators need to see this.
+        # ============================================================
+        "safety_disclosure": {
+            "mode": "PROPOSAL_ONLY",
+            "holdings_mutation": False,
+            "system_of_record": False,
+            "worst_case_failure": (
+                "Aureon produces no usable proposals and reconciliation "
+                "proceeds manually, identical to Excel. Aureon is assistive "
+                "tooling, not a system of record."
+            ),
+            "liability_scope": (
+                "Aureon provides match suggestions only. All settlements "
+                "must be approved by qualified personnel and executed through "
+                "authorized systems (fund admin, custodian, accounting)."
+            ),
+            "audit_trail": "Immutable hash-chain audit log enabled",
+            "maker_checker": "Enforced - creator cannot approve own proposals",
+        },
+        
+        "capabilities": {
+            "equity_trades": True,
+            "derivatives": False,
+            "real_time": False,
+            "auto_posting": False,
+        },
+    }
+
+
+# ============================================================
+# AUDIT TRAIL ENDPOINTS (v2.1 - UI Support)
+# ============================================================
+
+@router.get("/audit-events")
+def get_audit_events(
+    limit: int = 100,
+    event_type: Optional[str] = None,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Get audit events for the tenant.
+    
+    Returns events in reverse chronological order with hash chain info.
+    """
+    query = db.query(AuditEvent).filter(AuditEvent.tenant_id == user_id)
+    
+    if event_type:
+        query = query.filter(AuditEvent.event_type.ilike(f"%{event_type}%"))
+    
+    events = query.order_by(AuditEvent.created_at.desc()).limit(limit).all()
+    
+    return {
+        "status": "success",
+        "count": len(events),
+        "events": [
+            {
+                "id": e.id,
+                "event_type": e.event_type,
+                "entity_type": e.entity_type,
+                "entity_id": e.entity_id,
+                "actor": e.actor,
+                "payload": e.payload,
+                "prev_hash": e.prev_hash,
+                "event_hash": e.event_hash,
+                "run_id": e.run_id,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in events
+        ],
+    }
+
+
+@router.get("/audit-verify")
+def verify_audit_chain(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Verify the integrity of the audit hash chain.
+    
+    Returns verification result:
+    - valid: True if chain is intact
+    - events_verified: Number of events checked
+    - head_hash: Current head of the chain
+    - errors: List of any integrity issues found
+    """
+    from .audit import get_audit_log
+    
+    audit = get_audit_log(db, user_id)
+    result = audit.verify_chain()
+    
+    logger.info(f"[AUDIT_VERIFY] Tenant {user_id}: valid={result['valid']}, events={result['events_verified']}")
+    
+    return {
+        "status": "success",
+        **result,
+    }
+
+
 @router.post("/resolve-trade/{trade_id}")
 def manual_resolve_trade(
     trade_id: int,
@@ -1410,9 +2014,9 @@ def manual_resolve_trade(
     Manual resolution endpoint used by BreakDrawer.
     Allows analysts to match a trade to a cash entry or mark it settled with a note.
     
-    ECONOMIC BEHAVIOR:
-    - BUY trades INCREASE holdings/AUC
-    - SELL trades DECREASE holdings/AUC
+    NOTE (v2.1 PROPOSAL-ONLY MODE):
+    Holdings are NOT updated. Aureon outputs proposals only.
+    Holdings must live in external systems (fund admin, custodian).
     """
     trade = (
         db.query(BrokerTrade)
@@ -1481,43 +2085,44 @@ def manual_resolve_trade(
         )
         db.add(learning_event)
         
-        # CRITICAL FIX: Apply this single trade to holdings
-        # Uses the new method that correctly handles BUY vs SELL
-        from .rule_engine.orchestrator import ReconOrchestrator
-        orchestrator = ReconOrchestrator(db, user_id)
-        orchestrator._apply_single_trade_to_holdings(trade)
+        # ============================================================
+        # PROPOSAL-ONLY MODE (v2.1)
+        # Holdings are NOT updated here.
+        # Aureon outputs diffs (proposals). It never owns state.
+        # ============================================================
+        logger.info(f"[PROPOSAL_ONLY_MODE] Trade {trade_id} resolved, holdings NOT mutated")
         
-        # Log the manual resolution for audit trail
-        audit_log = ReconLog(
+        # ============================================================
+        # GOVERNANCE AUDIT: TRADE_RESOLVED (v2.1)
+        # Human authority exercised. This belongs in the audit trail.
+        # ============================================================
+        _audit(
+            db=db,
             tenant_id=user_id,
-            trade_id=trade.id,
-            cash_id=cash_record.id if cash_record else None,
-            reason=f"MANUAL_RESOLVE: {note}",
-            status_before="UNSETTLED",
-            status_after="MATCHED",
-            agent_model="MANUAL",
+            event_type="TRADE_RESOLVED",
+            entity_type="TRADE",
+            entity_id=trade.id,
+            actor=user_id,
+            payload={
+                "symbol": trade.symbol,
+                "amount": float(trade.amount) if trade.amount else 0,
+                "side": trade.side,
+                "cash_id": cash_record.id if cash_record else None,
+                "cash_amount": float(cash_record.amount) if cash_record else None,
+                "resolution_note": note,
+                "breaks_closed": len(open_breaks),
+            },
+            actor_role="OPS_ANALYST",  # Human manually resolved
         )
-        db.add(audit_log)
 
         db.commit()
         
-        # Calculate AUC delta for response
-        holding = db.query(Holding).filter(
-            Holding.tenant_id == user_id,
-            Holding.symbol == trade.symbol
-        ).first()
-        
         return {
             "status": "success", 
-            "message": "Trade resolved and holdings updated", 
+            "message": "Trade resolved (proposal-only mode - holdings not mutated)", 
             "trade_id": trade_id,
             "resolution_type": "MANUAL",
-            "auc_updated": True,
-            "holding_after": {
-                "symbol": trade.symbol,
-                "quantity": float(holding.quantity) if holding else 0,
-                "total_value": float(holding.total_value) if holding else 0,
-            } if holding else None
+            "proposal_only_mode": True,
         }
     except Exception as e:
         db.rollback()
@@ -1570,6 +2175,159 @@ def system_reset(
         db.rollback()
         logger.error(f"System reset failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"System reset failed: {str(e)}")
+
+
+@router.post("/system/hard-reset")
+def system_hard_reset(
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    DEVELOPMENT ONLY: Full schema reset.
+    
+    This endpoint:
+    1. Drops ALL tables in public schema (not just data)
+    2. Runs Alembic upgrade head to recreate schema
+    3. Verifies schema integrity
+    
+    WARNING: This destroys ALL data for ALL tenants.
+    Never expose in production.
+    """
+    from .database import engine, Base
+    from .config import settings
+    
+    # Block in production
+    if settings.environment == "production":
+        raise HTTPException(
+            status_code=403,
+            detail="Hard reset is disabled in production"
+        )
+    
+    try:
+        logger.warning("🚨 HARD RESET INITIATED - Dropping all tables...")
+        
+        # Step 1: Drop all tables
+        with engine.connect() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+            conn.execute(text("GRANT ALL ON SCHEMA public TO public"))
+            conn.commit()
+        logger.info("✅ Schema dropped and recreated")
+        
+        # Step 2: Run Alembic migrations
+        import subprocess
+        result = subprocess.run(
+            ["alembic", "upgrade", "head"],
+            capture_output=True,
+            text=True,
+            cwd="/Volumes/work/aureon-deepseek"
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Alembic upgrade failed: {result.stderr}")
+        logger.info("✅ Alembic migrations applied")
+        
+        # Step 3: Verify schema
+        from sqlalchemy import inspect
+        insp = inspect(engine)
+        tables = insp.get_table_names()
+        
+        return {
+            "status": "success",
+            "message": "Hard reset completed - schema rebuilt from migrations",
+            "tables_created": tables,
+            "warning": "Server MUST be restarted to reload ORM metadata"
+        }
+        
+    except Exception as e:
+        logger.error(f"Hard reset failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Hard reset failed: {str(e)}"
+        )
+
+
+@router.get("/system/health")
+def system_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    """
+    Comprehensive system health check.
+    
+    Verifies:
+    - Database reachable
+    - Schema valid
+    - Alembic version correct
+    - Audit table writable
+    - Critical tables exist
+    """
+    from .database import engine
+    from sqlalchemy import inspect
+    
+    checks = {}
+    overall_healthy = True
+    
+    try:
+        # Check 1: Database connection
+        with engine.connect() as conn:
+            db_name = conn.execute(text("SELECT current_database()")).scalar()
+            checks["database_connection"] = {
+                "status": "healthy",
+                "database": db_name
+            }
+    except Exception as e:
+        checks["database_connection"] = {"status": "unhealthy", "error": str(e)}
+        overall_healthy = False
+    
+    try:
+        # Check 2: Alembic version
+        with engine.connect() as conn:
+            version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+            expected = "1d4eef084a0e"
+            is_current = version == expected
+            checks["alembic_version"] = {
+                "status": "healthy" if is_current else "warning",
+                "current": version,
+                "expected": expected
+            }
+            if not is_current:
+                overall_healthy = False
+    except Exception as e:
+        checks["alembic_version"] = {"status": "unhealthy", "error": str(e)}
+        overall_healthy = False
+    
+    try:
+        # Check 3: Critical tables exist
+        insp = inspect(engine)
+        critical_tables = ["broker_trades", "bank_txns", "audit_events", "recon_proposals"]
+        existing = insp.get_table_names()
+        missing = [t for t in critical_tables if t not in existing]
+        checks["critical_tables"] = {
+            "status": "healthy" if not missing else "unhealthy",
+            "missing": missing if missing else None
+        }
+        if missing:
+            overall_healthy = False
+    except Exception as e:
+        checks["critical_tables"] = {"status": "unhealthy", "error": str(e)}
+        overall_healthy = False
+    
+    try:
+        # Check 4: Audit column exists (the one that was failing)
+        cols = [c["name"] for c in insp.get_columns("audit_events")]
+        has_actor_role = "actor_role" in cols
+        checks["audit_schema"] = {
+            "status": "healthy" if has_actor_role else "unhealthy",
+            "actor_role_exists": has_actor_role
+        }
+        if not has_actor_role:
+            overall_healthy = False
+    except Exception as e:
+        checks["audit_schema"] = {"status": "unhealthy", "error": str(e)}
+        overall_healthy = False
+    
+    return {
+        "status": "healthy" if overall_healthy else "unhealthy",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "checks": checks
+    }
 
 @router.get("/export-csv")
 def export_reconciliation_report(

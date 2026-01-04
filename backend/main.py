@@ -50,6 +50,65 @@ async def lifespan(app: FastAPI):
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("✅ Database initialized successfully")
+        
+        # ════════════════════════════════════════════════════════════
+        # BRUTAL STARTUP INVARIANTS (v2.2)
+        # If ANY of these fail, the app will NOT start.
+        # This prevents silent corruption from ever running in prod.
+        # ════════════════════════════════════════════════════════════
+        from sqlalchemy import text, inspect
+        insp = inspect(engine)
+        
+        with engine.connect() as conn:
+            # INVARIANT 1: Correct database
+            db_name = conn.execute(text("SELECT current_database()")).scalar()
+            schema_name = conn.execute(text("SELECT current_schema()")).scalar()
+            logger.info(f"✅ Connected to database: {db_name}, schema: {schema_name}")
+            
+            # INVARIANT 2: Alembic migration head check
+            EXPECTED_ALEMBIC_HEAD = "1d4eef084a0e"  # complete_schema_baseline_v3
+            try:
+                result = conn.execute(text("SELECT version_num FROM alembic_version"))
+                current_head = result.scalar()
+                if current_head != EXPECTED_ALEMBIC_HEAD:
+                    raise RuntimeError(
+                        f"🚨 ALEMBIC VERSION MISMATCH: Expected {EXPECTED_ALEMBIC_HEAD}, got {current_head}. "
+                        f"Run 'alembic upgrade head'."
+                    )
+                logger.info(f"✅ Alembic version verified: {current_head}")
+            except Exception as e:
+                if "alembic_version" in str(e).lower() and "does not exist" in str(e).lower():
+                    raise RuntimeError(
+                        "🚨 ALEMBIC NOT INITIALIZED: Run 'alembic upgrade head' first."
+                    )
+                raise
+            
+            # INVARIANT 3: Critical columns exist (ORM/DB sync check)
+            REQUIRED_COLUMNS = {
+                "audit_events": ["actor_role", "event_hash", "prev_hash"],
+                "broker_trades": ["tenant_id", "status"],
+                "recon_proposals": ["created_by", "approved_by"],
+            }
+            
+            for table, required_cols in REQUIRED_COLUMNS.items():
+                try:
+                    cols = [c["name"] for c in insp.get_columns(table)]
+                    missing = [c for c in required_cols if c not in cols]
+                    if missing:
+                        raise RuntimeError(
+                            f"🚨 SCHEMA DRIFT: {table} missing columns {missing}. "
+                            f"Run 'alembic upgrade head'."
+                        )
+                except Exception as e:
+                    if "does not exist" in str(e).lower():
+                        raise RuntimeError(
+                            f"🚨 TABLE MISSING: {table} does not exist. "
+                            f"Run 'alembic upgrade head'."
+                        )
+                    raise
+            
+            logger.info("✅ Schema verification passed (all critical columns exist)")
+            
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {str(e)}")
         raise

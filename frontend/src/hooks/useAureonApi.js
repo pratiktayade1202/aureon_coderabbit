@@ -11,7 +11,7 @@ export const useAureonApi = () => {
   const request = useCallback(async (endpoint, options = {}) => {
     try {
       const token = await getToken();
-      
+
       const defaultHeaders = {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${token}`,
@@ -36,7 +36,7 @@ export const useAureonApi = () => {
       if (res.status === 403) throw new Error("Access Restricted");
 
       const data = await res.json();
-      
+
       if (!res.ok) {
         throw new Error(data.message || data.detail || `API Error ${res.status}`);
       }
@@ -52,27 +52,42 @@ export const useAureonApi = () => {
     // 1. DASHBOARD
     // Align with backend route: /api/v1/recon/dashboard-stats
     getStats: () => request("/recon/dashboard-stats"),
-    
+
     // 2. INGESTION (Updated Path)
-    uploadIngestionFile: (formData) => request("/ingestion/upload", { 
-      method: "POST", 
-      body: formData 
+    uploadIngestionFile: (formData) => request("/ingestion/upload", {
+      method: "POST",
+      body: formData
     }),
-    
+
+    // 2.1 GLASS-BOX INGESTION (v3)
+    startIngestionSession: (formData) => request("/ingestion/sessions", {
+      method: "POST",
+      body: formData
+    }),
+    getSessionStatus: (sessionId) => request(`/ingestion/sessions/${sessionId}`),
+    approveContract: (contractId, mapping, destructiveAck = false) => request(`/ingestion/contracts/${contractId}/approve`, {
+      method: "POST",
+      body: JSON.stringify({
+        contract_id: contractId,
+        final_mapping: mapping,
+        destructive_ack: destructiveAck
+      })
+    }),
+
     // 3. ENGINE & RECONCILIATION
     // Fetch trades in frontend-ready format
     getTrades: () => request("/recon/trades"),
-    
+
     // Fetches Open Breaks
     getBreaks: () => request("/recon/breaks"),
-    
+
     // 4. AI & TOOLS
     // Asks AI Agent to analyze a specific trade/break
     getBreakAnalysis: (tradeId) => request(`/recon/analyze/${tradeId}`),
-    
+
     // Fetches patterns learned by the system
     getLearnedRules: () => request("/learned-rules"),
-    
+
     // 5. MANUAL RESOLUTION
     // Resolves a trade via the new backend endpoint
     manualResolve: (tradeId, payload = {}) => request(`/recon/resolve-trade/${tradeId}`, {
@@ -88,6 +103,6 @@ export const useAureonApi = () => {
 
     // 7. TRAINING (for Learner page)
     learnRules: () => request("/learned-rules/train", { method: "POST" }),
-    
-  }), [request]); 
+
+  }), [request]);
 };
