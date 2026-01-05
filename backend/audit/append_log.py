@@ -161,6 +161,7 @@ class AppendOnlyLog:
                 "entity_type": event.entity_type,
                 "entity_id": event.entity_id,
                 "actor": event.actor,
+                "actor_role": event.actor_role,
                 "payload": event.payload,
                 "prev_hash": event.prev_hash,
             }

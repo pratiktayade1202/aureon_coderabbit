@@ -4,7 +4,11 @@ if [ -f venv/bin/activate ]; then
     source venv/bin/activate
 fi
 
-export DATABASE_URL=postgresql://aureon:aureon123@localhost:5432/custody_ai
+# Require DATABASE_URL from environment (no hardcoded credentials)
+if [ -z "$DATABASE_URL" ]; then
+    echo "ERROR: DATABASE_URL environment variable is required"
+    exit 1
+fi
 
 echo "========================================================"
 echo "          AUREON SYSTEM DIAGNOSTIC REPORT"

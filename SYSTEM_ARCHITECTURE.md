@@ -96,7 +96,7 @@
 - **Features**:
   - Protocol ticker (SWIFT, NSDL, CDSL, etc.)
   - Technical architecture showcase
-  - Investor access modal (password: `aureon2025`)
+  - Investor access modal (password protected)
   - Links to PitchDeck component
 
 #### 3. **Dashboard View** (Main App)
@@ -751,5 +751,6 @@ PHASE_3_COMPLETE
 ---
 
 This architecture ensures **deterministic, auditable, and safe** reconciliation at scale.
+
 
 

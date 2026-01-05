@@ -1,9 +1,12 @@
 from sqlalchemy import create_engine, inspect
 import os
+import sys
 
-# Get DB URL from env or use default
-# Explicitly using the one from .env we saw earlier for reliability
-db_url = os.getenv("DATABASE_URL", "postgresql://aureon:aureon123@localhost:5432/custody_ai")
+# Get DB URL from env (required - no hardcoded credentials)
+db_url = os.getenv("DATABASE_URL")
+if not db_url:
+    print("ERROR: DATABASE_URL environment variable is required")
+    sys.exit(1)
 engine = create_engine(db_url)
 
 print("--- ORM REFLECTION CHECK: audit_events ---")

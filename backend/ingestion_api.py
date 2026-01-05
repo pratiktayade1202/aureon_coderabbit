@@ -590,12 +590,11 @@ def approve_contract(
         
         if result["status"] == "Completed":
             execution.status = "COMPLETED"
-            execution.rows_processed = result["total_rows"]
-            execution.logs = result["logs"]
+            execution.rows_ingested = result["total_rows"]
             execution.completed_at = datetime.utcnow()
         else:
             execution.status = "FAILED"
-            execution.logs = result["logs"]
+            execution.error_log = "\n".join(result.get("logs", []))
             
         db.commit()
         
@@ -608,7 +607,7 @@ def approve_contract(
         
     except Exception as e:
         execution.status = "FAILED"
-        execution.error_message = str(e)
+        execution.error_log = str(e)
         db.commit()
         logger.error(f"Execution failed: {e}")
     

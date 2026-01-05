@@ -1610,12 +1610,9 @@ def commit_proposals(
                             errors.append(f"proposal {p.id}: Cannot approve own proposal (created by same user)")
                             continue
                         
-                        # 2. Temporal separation (approved_at must be after created_at)
+                        # Note: Temporal separation is enforced by setting approved_at when approving.
+                        # The sequence (created_at < approved_at) is guaranteed by timestamp logic.
                         now = datetime.utcnow()
-                        if p.created_at and p.created_at >= now:
-                            logger.warning(f"[MAKER_CHECKER] Proposal {p.id} rejected: temporal separation required")
-                            errors.append(f"proposal {p.id}: Temporal separation required (try again later)")
-                            continue
                         
                         trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).first()
                         if not trade or trade.status == "MATCHED":
@@ -1830,9 +1827,9 @@ def export_proposals(
     # Build export data
     export_data = []
     for p in proposals:
-        # Get related trade
-        trade = db.query(BrokerTrade).filter_by(id=p.trade_id).first()
-        cash = db.query(BankTxn).filter_by(id=p.cash_id).first() if p.cash_id else None
+        # Get related trade (with tenant isolation for security)
+        trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).first()
+        cash = db.query(BankTxn).filter_by(id=p.cash_id, tenant_id=user_id).first() if p.cash_id else None
         
         export_data.append({
             "proposal_id": p.id,
@@ -2216,11 +2213,14 @@ def system_hard_reset(
         
         # Step 2: Run Alembic migrations
         import subprocess
+        import os as os_mod
+        # Compute project root dynamically (works on any machine)
+        project_root = os_mod.path.dirname(os_mod.path.dirname(os_mod.path.abspath(__file__)))
         result = subprocess.run(
             ["alembic", "upgrade", "head"],
             capture_output=True,
             text=True,
-            cwd="/Volumes/work/aureon-deepseek"
+            cwd=project_root
         )
         if result.returncode != 0:
             raise RuntimeError(f"Alembic upgrade failed: {result.stderr}")

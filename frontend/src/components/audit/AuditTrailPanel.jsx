@@ -71,6 +71,8 @@ const AuditTrailPanel = () => {
     const exportCSV = async () => {
         try {
             const token = await getToken();
+            // TODO: Create /recon/audit-events/export endpoint for consistency
+            // Currently exports proposals as audit panel workaround
             const res = await fetch(`${API_BASE_URL}/recon/proposals/export?format=csv`, {
                 headers: { Authorization: `Bearer ${token}` },
             });
@@ -125,8 +127,8 @@ const AuditTrailPanel = () => {
                     <div className="flex items-center gap-2">
                         {verificationResult && (
                             <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium ${verificationResult.valid
-                                    ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
-                                    : "bg-red-50 text-red-700 border border-red-200"
+                                ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                                : "bg-red-50 text-red-700 border border-red-200"
                                 }`}>
                                 {verificationResult.valid ? (
                                     <>
@@ -181,8 +183,8 @@ const AuditTrailPanel = () => {
                             key={type}
                             onClick={() => setFilterType(type)}
                             className={`px-2.5 py-1 text-[10px] font-medium rounded-md transition-all ${filterType === type
-                                    ? "bg-slate-900 text-white"
-                                    : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+                                ? "bg-slate-900 text-white"
+                                : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
                                 }`}
                         >
                             {type}
