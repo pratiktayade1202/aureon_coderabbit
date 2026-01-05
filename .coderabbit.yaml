@@ -1,0 +1,18 @@
+# CodeRabbit Configuration
+# Increase file limit for full codebase review
+
+reviews:
+  high_level_summary: true
+  review_status: true
+  # Don't skip large PRs
+  path_filters:
+    - "!**/*.zip"
+    - "!**/*.pdf"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.xlsx"
+  
+# Enable auto-review
+auto_review:
+  enabled: true
+  drafts: true
