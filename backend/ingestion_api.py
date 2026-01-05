@@ -432,10 +432,12 @@ async def start_ingestion_session(
         # Check for duplicate session? 
         # (Optional: check if exact file hash exists in 'COMPLETED' contracts?)
         
-        # SECURITY: Use secure temp file with auto-cleanup
-        with secure_temp_file(prefix="aureon_", suffix=os.path.splitext(file.filename)[1]) as storage_path:
+        # Create persistent temp file for session staging
+        # Note: This file is cleaned up in approve_contract after processing
+        fd, storage_path = tempfile.mkstemp(prefix="aureon_", suffix=os.path.splitext(file.filename)[1])
+        try:
             # Save File
-            with open(storage_path, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
                 f.write(content)
 
             session = IngestionSession(
@@ -449,6 +451,11 @@ async def start_ingestion_session(
             )
             db.add(session)
             db.commit()
+        except Exception as e:
+            # Cleanup on error
+            if os.path.exists(storage_path):
+                os.unlink(storage_path)
+            raise
         
         # 2. Synchronous Analysis (for demo speed)
         # In prod, this would be a background task
