@@ -11,7 +11,7 @@ import tempfile
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -25,6 +25,8 @@ from .ingestion import process_file_content
 from .config import settings
 from .models import ProcessedFile, ReconLock, IngestionSession, IngestionContract, IngestionExecution
 from .schema_analyzer import SchemaAnalyzer
+from .utils.secure_files import secure_temp_file, check_zip_safety, get_safe_zip_members
+from .rate_limiting import limiter, UPLOAD_LIMIT
 import uuid
 import pandas as pd
 import io
@@ -157,7 +159,9 @@ def sanitize_filename(filename: str) -> str:
 
 # --- ENDPOINTS ---
 @router.post("/upload", response_model=UploadResponse)
+@limiter.limit(UPLOAD_LIMIT)
 async def upload_file(
+    request: Request,
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -418,27 +422,23 @@ async def start_ingestion_session(
         # Check for duplicate session? 
         # (Optional: check if exact file hash exists in 'COMPLETED' contracts?)
         
-        # 1. Create Storage Path (TEMP for V1)
-        # Use system temp directory to avoid Read-only FS errors in containers/prod
-        temp_dir = os.path.join(tempfile.gettempdir(), "aureon_ingestion")
-        os.makedirs(temp_dir, exist_ok=True)
-        storage_path = os.path.join(temp_dir, f"{session_id}_{file.filename}")
-        
-        # Save File
-        with open(storage_path, "wb") as f:
-            f.write(content)
+        # SECURITY: Use secure temp file with auto-cleanup
+        with secure_temp_file(prefix="aureon_", suffix=os.path.splitext(file.filename)[1]) as storage_path:
+            # Save File
+            with open(storage_path, "wb") as f:
+                f.write(content)
 
-        session = IngestionSession(
-            id=session_id,
-            tenant_id=user_id,
-            filename=file.filename,
-            file_hash=file_hash,
-            file_size=file_size,
-            storage_path=storage_path, # Real path now
-            status="ANALYZING"
-        )
-        db.add(session)
-        db.commit()
+            session = IngestionSession(
+                id=session_id,
+                tenant_id=user_id,
+                filename=file.filename,
+                file_hash=file_hash,
+                file_size=file_size,
+                storage_path=storage_path,
+                status="ANALYZING"
+            )
+            db.add(session)
+            db.commit()
         
         # 2. Synchronous Analysis (for demo speed)
         # In prod, this would be a background task
@@ -452,10 +452,17 @@ async def start_ingestion_session(
             elif file.filename.endswith((".xlsx", ".xls")):
                 df = pd.read_excel(io.BytesIO(content), nrows=20)
             elif file.filename.endswith(".zip"):
+                # SECURITY: Validate ZIP before extraction
+                try:
+                    check_zip_safety(content)
+                except ValueError as zip_err:
+                    logger.warning(f"ZIP safety check failed: {zip_err}")
+                    raise HTTPException(400, str(zip_err))
+                
                 from zipfile import ZipFile
                 with ZipFile(io.BytesIO(content)) as z:
-                    # Find first valid file
-                    valid_files = [n for n in z.namelist() if n.endswith((".csv", ".xlsx", ".xls")) and not n.startswith("__MACOSX")]
+                    # SECURITY: Use safe member extraction
+                    valid_files = get_safe_zip_members(content, (".csv", ".xlsx", ".xls"))
                     if valid_files:
                         target_file = valid_files[0]
                         with z.open(target_file) as f:
@@ -467,6 +474,8 @@ async def start_ingestion_session(
                         df = pd.DataFrame()
             else:
                 df = pd.DataFrame() # PDF not supported in v1 demo
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning(f"Analysis read failed: {e}")
             df = pd.DataFrame()

@@ -2,7 +2,7 @@
 """
 Reconciliation API endpoints with proper error handling and transaction safety.
 """
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text, func, case
 from typing import Dict, Any, List, Optional
@@ -23,6 +23,9 @@ from fastapi.responses import StreamingResponse
 
 router = APIRouter(tags=["reconciliation"])
 logger = logging.getLogger(__name__)
+
+# Rate limiting
+from .rate_limiting import limiter, SETTLEMENT_LIMIT, AI_RESOLVE_LIMIT
 
 
 # --- TENANT ISOLATION: MUTEX LOCK HELPER ---
@@ -296,7 +299,9 @@ def _reset_tenant_data(db: Session, user_id: str) -> None:
     db.execute(text("DELETE FROM processed_files WHERE tenant_id = :tid"), {"tid": user_id})
 
 @router.post("/run-settlement-engine")
+@limiter.limit(SETTLEMENT_LIMIT)
 def run_settlement_engine(
+    request: Request,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -400,7 +405,9 @@ def run_settlement_engine(
 
 
 @router.post("/auto-resolve")
+@limiter.limit(AI_RESOLVE_LIMIT)
 def run_auto_resolve(
+    request: Request,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),

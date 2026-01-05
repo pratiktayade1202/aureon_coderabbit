@@ -13,8 +13,11 @@ import {
 } from "lucide-react";
 import { useAuth } from "@clerk/clerk-react";
 import { API_BASE_URL } from "../config";
+import { validateFileBatch, FILE_CONFIG } from "../utils/fileValidation";
 
 const API_BASE = API_BASE_URL;
+const MAX_CONCURRENT_UPLOADS = 2;
+const UPLOAD_DELAY_MS = 1000;
 
 /**
  * FileUploader
@@ -79,21 +82,51 @@ const FileUploader = ({ onUploadSuccess }) => {
     }
   };
 
-  // Process all files sequentially
+  // Process all files with rate limiting
   const processAllFiles = async (files) => {
     if (!files || files.length === 0) return;
+
+    // Validate files before upload
+    const { validFiles, invalidFiles, batchError } = validateFileBatch(files);
+
+    if (batchError) {
+      setOverallStatus({ type: "error", msg: batchError });
+      return;
+    }
+
+    if (invalidFiles.length > 0) {
+      const errorSummary = invalidFiles.map(f => `${f.name}: ${f.errors[0]}`).join('; ');
+      if (validFiles.length === 0) {
+        setOverallStatus({ type: "error", msg: `All files invalid: ${errorSummary}` });
+        return;
+      }
+      // Continue with valid files, warn about invalid ones
+      console.warn('Some files were invalid:', invalidFiles);
+    }
 
     setIsUploading(true);
     setOverallStatus(null);
 
-    // Initialize queue with pending status
-    const initialQueue = Array.from(files).map(file => ({
+    // Initialize queue with pending status (only valid files)
+    const initialQueue = validFiles.map(file => ({
       name: file.name,
       size: file.size,
       status: "pending",
       message: null,
       file: file,
     }));
+
+    // Add invalid files as already errored
+    invalidFiles.forEach(f => {
+      initialQueue.push({
+        name: f.name,
+        size: 0,
+        status: "error",
+        message: f.errors[0],
+        file: null,
+      });
+    });
+
     setFileQueue(initialQueue);
 
     try {
@@ -101,17 +134,33 @@ const FileUploader = ({ onUploadSuccess }) => {
       let successCount = 0;
       let totalRows = 0;
 
-      // Process files sequentially
-      for (let i = 0; i < files.length; i++) {
-        const result = await processSingleFile(files[i], i, token);
-        if (result.success) {
-          successCount++;
-          totalRows += result.rows || 0;
+      // Process files in batches with rate limiting
+      for (let i = 0; i < validFiles.length; i += MAX_CONCURRENT_UPLOADS) {
+        const batch = validFiles.slice(i, i + MAX_CONCURRENT_UPLOADS);
+
+        // Process batch concurrently
+        const results = await Promise.all(
+          batch.map((file, batchIdx) =>
+            processSingleFile(file, i + batchIdx, token)
+          )
+        );
+
+        results.forEach(result => {
+          if (result.success) {
+            successCount++;
+            totalRows += result.rows || 0;
+          }
+        });
+
+        // Delay between batches (if more batches remain)
+        if (i + MAX_CONCURRENT_UPLOADS < validFiles.length) {
+          await new Promise(resolve => setTimeout(resolve, UPLOAD_DELAY_MS));
         }
       }
 
       // Set overall status
-      if (successCount === files.length) {
+      const totalFiles = validFiles.length + invalidFiles.length;
+      if (successCount === validFiles.length && invalidFiles.length === 0) {
         setOverallStatus({
           type: "success",
           msg: `Successfully uploaded ${successCount} file${successCount > 1 ? 's' : ''} (${totalRows} total rows)`,
@@ -120,7 +169,7 @@ const FileUploader = ({ onUploadSuccess }) => {
       } else if (successCount > 0) {
         setOverallStatus({
           type: "warning",
-          msg: `Uploaded ${successCount}/${files.length} files (${totalRows} rows). Some files failed.`,
+          msg: `Uploaded ${successCount}/${totalFiles} files (${totalRows} rows). Some files failed.`,
         });
         setTimeout(() => onUploadSuccess(), 1500);
       } else {
@@ -142,7 +191,7 @@ const FileUploader = ({ onUploadSuccess }) => {
   const handleFileChange = (e) => {
     const files = e.target.files;
     if (files && files.length > 0) {
-      processAllFiles(files);
+      processAllFiles(Array.from(files));
     }
     // Reset input so same files can be re-selected
     e.target.value = "";
@@ -153,7 +202,7 @@ const FileUploader = ({ onUploadSuccess }) => {
     setIsDragActive(false);
     const files = e.dataTransfer.files;
     if (files && files.length > 0) {
-      processAllFiles(files);
+      processAllFiles(Array.from(files));
     }
   }, []);
 

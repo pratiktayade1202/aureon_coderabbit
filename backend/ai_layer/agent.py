@@ -20,6 +20,14 @@ from typing import Dict, Any, List, Optional
 from ..llm_gateway import LLMGateway
 from ..models import LearningEvent
 
+# Security: Prompt injection protection and response validation
+from .prompt_sanitizer import (
+    sanitize_trade_data,
+    sanitize_cash_candidate,
+    sanitize_learning_examples,
+)
+from .response_validator import AIReasoningResponse
+
 logger = logging.getLogger(__name__)
 
 
@@ -336,38 +344,27 @@ class AIAgent:
             Returns None if AI call fails.
         """
         try:
-            # Serialize trade data
-            trade_summary = {
-                "id": trade.get("id"),
-                "date": str(trade.get("date")),
-                "symbol": trade.get("symbol"),
-                "side": trade.get("side"),
-                "amount": float(trade.get("amount") or 0),
-                "quantity": float(trade.get("quantity") or 0),
-                "currency": trade.get("currency", "INR"),
-            }
+            # SECURITY: Sanitize all user-controlled data before prompt injection
+            trade_summary = sanitize_trade_data(trade)
             
-            # Serialize candidates
-            candidates_summary = []
-            for c in candidates:
-                candidates_summary.append({
-                    "id": c.get("id"),
-                    "date": str(c.get("date")),
-                    "amount": float(c.get("amount") or 0),
-                    "description": str(c.get("description") or "")[:100],
-                })
+            # Sanitize candidates
+            candidates_summary = [
+                sanitize_cash_candidate(c) for c in candidates
+            ]
 
             # === Phase 3: Active Learning (Few-shot context injection) ===
             past_learnings = self._fetch_relevant_learnings(trade)
+            # SECURITY: Sanitize learning examples
+            sanitized_learnings = sanitize_learning_examples(past_learnings)
             learnings_text = ""
-            if past_learnings:
+            if sanitized_learnings:
                 learnings_text = (
                     "PAST HUMAN RESOLUTIONS (USE AS GUIDANCE; DO NOT HALLUCINATE):\n"
-                    + json.dumps(past_learnings, indent=2)
+                    + json.dumps(sanitized_learnings, indent=2)
                     + "\n"
                 )
             
-            # Build context for AI reasoning
+            # Build context for AI reasoning (all data now sanitized)
             context = f"""Analyze this financial reconciliation scenario and determine the best match.
 
 TRADE TO RECONCILE:
@@ -401,24 +398,23 @@ ACTION DEFINITIONS:
             
             # Call the unified reasoning gateway (model-agnostic)
             result_str = LLMGateway.reason_on_discrepancy(context, use_json=True)
-            result = json.loads(result_str)
+            result_dict = json.loads(result_str)
             
-            # Validate response structure
-            if not all(k in result for k in ["best_match_id", "confidence", "explanation"]):
-                logger.warning(f"AI response missing required fields: {result}")
+            # SECURITY: Validate response with Pydantic model
+            validated = AIReasoningResponse.from_raw_response(result_dict)
+            if validated is None:
+                logger.warning(f"AI response validation failed: {result_dict}")
                 return None
             
-            # Ensure action is set
-            if "action" not in result:
-                conf = result.get("confidence", 0.0)
-                if conf > 0.9:
-                    result["action"] = "MATCH"
-                elif conf > 0.7:
-                    result["action"] = "REVIEW"
-                else:
-                    result["action"] = "ESCALATE"
+            # Convert back to dict for compatibility
+            result = {
+                "best_match_id": validated.best_match_id,
+                "confidence": validated.confidence,
+                "action": validated.action,
+                "explanation": validated.explanation,
+            }
             
-            logger.debug(f"AI analysis result: {result}")
+            logger.debug(f"AI analysis result (validated): {result}")
             return result
                 
         except json.JSONDecodeError as e:

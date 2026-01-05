@@ -1,5 +1,6 @@
 // src/components/DataTable.jsx
 import React, { useEffect, useMemo, useState } from "react";
+import { sanitizeText } from "../utils/sanitize";
 import {
   useReactTable,
   getCoreRowModel,
@@ -95,11 +96,10 @@ const StatusCell = ({ value, bankRef }) => {
     // Manual / Rule match (Green)
     return (
       <span
-        className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold border ${
-          isManual
+        className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold border ${isManual
             ? "bg-emerald-50 text-emerald-700 border-emerald-200"
             : "bg-green-50 text-green-700 border-green-200"
-        }`}
+          }`}
       >
         {isManual ? <Wrench size={12} /> : <CheckCircle2 size={12} />}
         {isManual ? "MANUAL MATCH" : isRule ? "RULE MATCH" : "MATCHED"}
@@ -189,11 +189,10 @@ const DataTable = ({
               e.stopPropagation();
               row.getToggleSelectedHandler()(e);
             }}
-            className={`p-1 rounded ${
-              row.getIsSelected()
+            className={`p-1 rounded ${row.getIsSelected()
                 ? "text-aureon-blue"
                 : "text-slate-300 hover:text-slate-500"
-            }`}
+              }`}
             aria-label="Select row"
             title="Select row"
           >
@@ -222,14 +221,14 @@ const DataTable = ({
               const status = row.original.status;
               const statusStr = typeof status === "object" ? status.status : status;
               const bankRef = row.original.bank_ref || "";
-              
+
               if (statusStr === "BREAK") return 1;
               if (statusStr === "UNSETTLED") return 2;
               if (statusStr === "MATCHED" && (bankRef.startsWith("AI Matched") || bankRef.includes("AI Auto-Resolved"))) return 3;
               if (statusStr === "MATCHED") return 4;
               return 5;
             };
-            
+
             return getPriority(rowA) - getPriority(rowB);
           },
         },
@@ -262,11 +261,10 @@ const DataTable = ({
             const isBuy = s === "BUY";
             return (
               <span
-                className={`text-[10px] font-bold px-1.5 py-[1px] rounded-sm ${
-                  isBuy
+                className={`text-[10px] font-bold px-1.5 py-[1px] rounded-sm ${isBuy
                     ? "bg-blue-50 text-aureon-blue"
                     : "bg-amber-50 text-status-warning"
-                }`}
+                  }`}
               >
                 {s}
               </span>
@@ -310,14 +308,17 @@ const DataTable = ({
           header: "Bank Ref",
           accessorKey: "bank_ref",
           size: 160,
-          cell: (info) => (
-            <span
-              className="text-[11px] text-ink-faint truncate max-w-[160px] block"
-              title={info.getValue()}
-            >
-              {info.getValue() || "---"}
-            </span>
-          ),
+          cell: (info) => {
+            const value = sanitizeText(info.getValue());
+            return (
+              <span
+                className="text-[11px] text-ink-faint truncate max-w-[160px] block"
+                title={value}
+              >
+                {value || "---"}
+              </span>
+            );
+          },
         },
         {
           id: "actions",
@@ -331,10 +332,10 @@ const DataTable = ({
             const status = typeof statusObj === "object" && statusObj !== null
               ? (statusObj.status || "")
               : (statusObj || "");
-            
+
             // Show Resolve button only for BREAK and UNSETTLED statuses
             const showResolve = status === "BREAK" || status === "UNSETTLED";
-            
+
             if (!showResolve) return null;
 
             return (
@@ -477,14 +478,14 @@ const DataTable = ({
     enableRowSelection:
       view === "Trades"
         ? (row) => {
-            const statusObj = row.original?.status;
-            const statusStr =
-              typeof statusObj === "object" && statusObj !== null
-                ? statusObj.status
-                : statusObj;
-            const s = String(statusStr || "").toUpperCase();
-            return !(s === "MATCHED" || s.includes("SETTLED"));
-          }
+          const statusObj = row.original?.status;
+          const statusStr =
+            typeof statusObj === "object" && statusObj !== null
+              ? statusObj.status
+              : statusObj;
+          const s = String(statusStr || "").toUpperCase();
+          return !(s === "MATCHED" || s.includes("SETTLED"));
+        }
         : false,
     onRowSelectionChange: setRowSelection,
     getCoreRowModel: getCoreRowModel(),
@@ -550,20 +551,18 @@ const DataTable = ({
                           : undefined
                       }
                       className={`py-1.5 px-3 text-[10px] font-semibold text-ink-faint uppercase tracking-wider border-r border-aureon-border last:border-r-0 select-none
-                        ${
-                          sortable
-                            ? "cursor-pointer hover:bg-slate-100"
-                            : ""
+                        ${sortable
+                          ? "cursor-pointer hover:bg-slate-100"
+                          : ""
                         }
                         ${align === "right" ? "text-right" : "text-left"}
                       `}
                     >
                       <div
-                        className={`flex items-center gap-1 ${
-                          align === "right"
+                        className={`flex items-center gap-1 ${align === "right"
                             ? "justify-end"
                             : "justify-start"
-                        }`}
+                          }`}
                       >
                         {flexRender(
                           header.column.columnDef.header,
@@ -603,9 +602,8 @@ const DataTable = ({
               table.getRowModel().rows.map((row) => (
                 <tr
                   key={row.id}
-                  className={`group hover:bg-slate-50 transition-colors ${
-                    row.getIsSelected() ? "bg-blue-50/30" : ""
-                  }`}
+                  className={`group hover:bg-slate-50 transition-colors ${row.getIsSelected() ? "bg-blue-50/30" : ""
+                    }`}
                 >
                   {row.getVisibleCells().map((cell) => {
                     const align =
@@ -614,10 +612,9 @@ const DataTable = ({
                       <td
                         key={cell.id}
                         className={`py-1.5 px-3 text-xs text-ink-strong border-r border-aureon-border last:border-r-0
-                          ${
-                            align === "right"
-                              ? "text-right font-mono tabular-nums"
-                              : "text-left"
+                          ${align === "right"
+                            ? "text-right font-mono tabular-nums"
+                            : "text-left"
                           }`}
                       >
                         {flexRender(

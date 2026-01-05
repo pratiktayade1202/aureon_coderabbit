@@ -32,6 +32,10 @@ from .seed_rules import ensure_rule_definitions_exist
 from .auth import get_current_user
 from .database import get_db
 
+# Rate limiting
+from .rate_limiting import limiter, rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
 # Initialize logging
 logger = setup_logging(settings.environment)
 
@@ -163,6 +167,10 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Request-ID", "X-Response-Time"],
 )
+
+# 6. Rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 
 # --- GLOBAL ERROR HANDLERS ---

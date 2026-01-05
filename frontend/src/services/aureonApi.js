@@ -1,5 +1,6 @@
 // src/services/aureonApi.js
 import { API_BASE_URL } from '../config';
+import { logger } from '../utils/logger';
 
 const request = async (path, options = {}) => {
   const { token, method = "GET", body } = options;
@@ -15,7 +16,7 @@ const request = async (path, options = {}) => {
   };
 
   const url = `${API_BASE_URL}${path}`;
-  console.log(`[API] ${method} ${url}`);
+  logger.api(method, path);
 
   const res = await fetch(url, config);
   if (!res.ok) {
