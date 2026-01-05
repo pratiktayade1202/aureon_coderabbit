@@ -2700,7 +2700,7 @@ def system_health(db: Session = Depends(get_db)) -> Dict[str, Any]:
         # Check 2: Alembic version
         with engine.connect() as conn:
             version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-            expected = "1d4eef084a0e"
+            expected = "2a5b7c9d0e1f"
             is_current = version == expected
             checks["alembic_version"] = {
                 "status": "healthy" if is_current else "warning",

@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
             logger.info(f"✅ Connected to database: {db_name}, schema: {schema_name}")
             
             # INVARIANT 2: Alembic migration head check
-            EXPECTED_ALEMBIC_HEAD = "1d4eef084a0e"  # complete_schema_baseline_v3
+            EXPECTED_ALEMBIC_HEAD = "2a5b7c9d0e1f"  # float_to_numeric migration
             try:
                 result = conn.execute(text("SELECT version_num FROM alembic_version"))
                 current_head = result.scalar()
