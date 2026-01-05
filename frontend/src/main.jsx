@@ -21,16 +21,29 @@ if (!CLERK_KEY) {
   throw new Error("Missing Clerk Publishable Key");
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <ClerkProvider publishableKey={CLERK_KEY}>
-        <QueryClientProvider client={queryClient}>
-          <BrowserRouter>
-            <App />
-          </BrowserRouter>
-        </QueryClientProvider>
-      </ClerkProvider>
-    </ErrorBoundary>
-  </React.StrictMode>
-);
+import { initCsrfProtection } from './services/aureonApi';
+
+// Initialize CSRF protection before rendering
+initCsrfProtection().then(() => {
+  renderApp();
+}).catch(err => {
+  console.warn("CSRF initialization failed (likely dev mode or network error):", err);
+  // Still render the app - CSRF failure is handled on a per-request basis mostly
+  renderApp();
+});
+
+function renderApp() {
+  ReactDOM.createRoot(document.getElementById("root")).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <ClerkProvider publishableKey={CLERK_KEY}>
+          <QueryClientProvider client={queryClient}>
+            <BrowserRouter>
+              <App />
+            </BrowserRouter>
+          </QueryClientProvider>
+        </ClerkProvider>
+      </ErrorBoundary>
+    </React.StrictMode>
+  );
+}

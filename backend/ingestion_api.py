@@ -27,6 +27,7 @@ from .models import ProcessedFile, ReconLock, IngestionSession, IngestionContrac
 from .schema_analyzer import SchemaAnalyzer
 from .utils.secure_files import secure_temp_file, check_zip_safety, get_safe_zip_members
 from .rate_limiting import limiter, UPLOAD_LIMIT
+from fastapi_csrf_protect import CsrfProtect
 import uuid
 import pandas as pd
 import io
@@ -163,9 +164,12 @@ def sanitize_filename(filename: str) -> str:
 async def upload_file(
     request: Request,
     file: UploadFile = File(...),
+    csrf_protect: CsrfProtect = Depends(),
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # Enforce CSRF protection
+    csrf_protect.validate_csrf(request)
     """
     Ingest a file with Deduplication Protection (SHA256).
     

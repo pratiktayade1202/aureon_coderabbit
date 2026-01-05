@@ -22,6 +22,9 @@ from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 import hashlib
 
+# CSRF Protection
+from fastapi_csrf_protect import CsrfProtect
+
 router = APIRouter(tags=["reconciliation"])
 logger = logging.getLogger(__name__)
 
@@ -335,6 +338,7 @@ def run_settlement_engine(
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
     """
     PHASE 2: RUN SETTLEMENT ENGINE (Deterministic Rules Only)
@@ -356,6 +360,8 @@ def run_settlement_engine(
     - Holdings and AUC are updated
     - Button changes to "AUTO RESOLVE" for AI phase
     """
+    # Enforce CSRF protection
+    csrf_protect.validate_csrf(request)
     with acquire_tenant_lock(db, user_id, "Settlement Engine"):
         run_id = None
         try:
@@ -441,6 +447,7 @@ def run_auto_resolve(
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
     """
     PHASE 3: AUTO RESOLVE (AI/GPT Only)
@@ -464,6 +471,8 @@ def run_auto_resolve(
     - Holdings and AUC are finalized
     - Complete audit trail is visible
     """
+    # Enforce CSRF protection
+    csrf_protect.validate_csrf(request)
     with acquire_tenant_lock(db, user_id, "AI Auto-Resolve"):
         try:
             logger.info(f"AUTO RESOLVE (Phase 3 - AI Only) triggered for tenant {user_id}")
@@ -1605,22 +1614,21 @@ def resolve_bulk_trades(
 
 @router.post("/proposals/commit")
 def commit_proposals(
-    payload: Optional[CommitProposalsRequest] = Body(default=None),
-    min_confidence: float = 0.90,  # Safety threshold (query param fallback)
+    request: Request,
+    min_confidence: float = ConfidenceThreshold.HIGH,  # Default 0.95
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
     """
     EXECUTOR: Applies pending AI proposals to the Ledger.
     Only applies proposals above the confidence threshold.
     """
+    # Enforce CSRF protection
+    csrf_protect.validate_csrf(request)
     with acquire_tenant_lock(db, user_id, "Committing Proposals"):
         try:
-            threshold = (
-                float(payload.min_confidence)
-                if payload and payload.min_confidence is not None
-                else float(min_confidence)
-            )
+            threshold = float(min_confidence)
             proposals = (
                 db.query(ReconProposal)
                 .filter(
@@ -1762,7 +1770,8 @@ def preview_proposals(
     )
     
     preview_data = []
-    confidence_bands = {"high": 0, "medium": 0, "low": 0}  # >= 0.95, 0.80-0.95, < 0.80
+    # Confidence bands using centralized constants
+    confidence_bands = {"high": 0, "medium": 0, "low": 0}
     
     for p in proposals:
         # Get related trade
@@ -1770,10 +1779,10 @@ def preview_proposals(
         cash = db.query(BankTxn).filter_by(id=p.cash_id, tenant_id=user_id).first() if p.cash_id else None
         
         conf = float(p.confidence) if p.confidence else 0.0
-        if conf >= 0.95:
+        if conf >= ConfidenceThreshold.HIGH:
             confidence_bands["high"] += 1
             confidence_label = "HIGH"
-        elif conf >= 0.80:
+        elif conf >= ConfidenceThreshold.PROPOSAL_MINIMUM:
             confidence_bands["medium"] += 1
             confidence_label = "MEDIUM"
         else:
