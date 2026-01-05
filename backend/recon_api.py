@@ -36,6 +36,7 @@ from .constants import (
     ConfidenceThreshold,
     TradeStatus,
     ProposalStatus,
+    BreakStatus,
     DEFAULT_LOCK_TIMEOUT,
 )
 
@@ -121,9 +122,24 @@ class CommitProposalsRequest(BaseModel):
 
 class CreateRunRequest(BaseModel):
     """Request to create a new reconciliation run."""
-    run_id: str  # CLIENT-SUPPLIED, must be unique
+    run_id: str
     run_type: str = "SETTLEMENT"  # SETTLEMENT, AI_RESOLVE, MANUAL
     expected_sources: int = 1  # Number of files expected before run is complete
+
+
+class CreateBreakRequest(BaseModel):
+    """Request to manually create a break."""
+    trade_id: int
+    break_type: str
+    severity: str
+    amount_diff: float
+    note: Optional[str] = None
+
+
+class BreakResolutionRequest(BaseModel):
+    """Request to resolve a break."""
+    status: str
+    resolution_note: Optional[str] = None
 
 
 # ============================================================
@@ -224,6 +240,74 @@ def create_reconciliation_run(
         "expected_sources": run.expected_sources,
     }
 
+@router.post("/break/create")
+def create_break(
+    request: Request,
+    break_data: CreateBreakRequest = Body(...),
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
+) -> Dict[str, Any]:
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
+    """
+    Create a new reconciliation run with client-supplied ID.
+    
+    The run_id MUST be unique and is immutable - this enables:
+    - Idempotent retries (same run_id = same result)
+    """
+    try:
+        trade = db.query(BrokerTrade).filter_by(id=break_data.trade_id, tenant_id=user_id).first()
+        if not trade:
+            raise HTTPException(status_code=404, detail="Trade not found")
+
+        cash = None
+        if break_data.cash_id:
+            cash = db.query(BankTxn).filter_by(id=break_data.cash_id, tenant_id=user_id).first()
+            if not cash:
+                raise HTTPException(status_code=404, detail="Cash transaction not found")
+
+        new_break = ReconBreak(
+            tenant_id=user_id,
+            trade_id=break_data.trade_id,
+            cash_id=break_data.cash_id,
+            break_type=break_data.break_type,
+            severity=break_data.severity,
+            amount_diff=break_data.amount_diff,
+            note=break_data.note,
+            status=BreakStatus.OPEN,
+            created_by=user_id,
+        )
+        db.add(new_break)
+        db.commit()
+        db.refresh(new_break)
+
+        _audit(
+            db=db,
+            tenant_id=user_id,
+            event_type="BREAK_CREATED",
+            entity_type="BREAK",
+            entity_id=new_break.id,
+            actor=user_id,
+            payload={
+                "trade_id": new_break.trade_id,
+                "cash_id": new_break.cash_id,
+                "break_type": new_break.break_type,
+                "severity": new_break.severity,
+            },
+            actor_role="OPS_ANALYST",
+        )
+
+        return {
+            "status": "success",
+            "message": "Break created successfully",
+            "break_id": new_break.id,
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to create break: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create break: {str(e)}")
+
 
 @router.post("/runs/{run_id}/complete")
 def mark_run_complete(
@@ -289,6 +373,52 @@ def mark_run_complete(
         "trades_processed": run.trades_processed,
         "proposals_created": run.proposals_created,
     }
+
+
+@router.post("/proposals/reject/{proposal_id}")
+def reject_proposal(
+    request: Request,
+    proposal_id: int,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
+):
+    """Reject a specific proposal."""
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
+    proposal = db.query(ReconProposal).filter_by(id=proposal_id, tenant_id=user_id).first()
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+
+    if proposal.status != ProposalStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Only pending proposals can be rejected")
+
+    proposal.status = ProposalStatus.REJECTED
+    proposal.processed_at = datetime.utcnow()
+    proposal.approved_by = user_id # Record who rejected it
+    proposal.approved_at = datetime.utcnow() # Record when it was rejected
+
+    _audit(
+        db=db,
+        tenant_id=user_id,
+        event_type="PROPOSAL_REJECTED",
+        entity_type="PROPOSAL",
+        entity_id=proposal.id,
+        actor=user_id,
+        payload={
+            "trade_id": proposal.trade_id,
+            "cash_id": proposal.cash_id,
+            "confidence": float(proposal.confidence) if proposal.confidence else 0,
+            "source_model": proposal.source_model,
+            "created_by": proposal.created_by,
+        },
+        run_id=proposal.run_id,
+        actor_role="OPS_ANALYST",
+    )
+
+    db.commit()
+
+    return {"status": "success", "message": f"Proposal {proposal_id} rejected."}
 
 
 @router.get("/runs/{run_id}")
@@ -453,10 +583,12 @@ def run_auto_resolve(
     PHASE 3: AUTO RESOLVE (AI/GPT Only)
     
     This endpoint performs ONLY AI-based resolution of remaining breaks:
-    1. Analyzes all open breaks using GPT/AI reasoning
-    2. For high-confidence AI matches (≥ 0.85):
-       - Resolves the break
-       - Updates trade status to MATCHED
+    PHASE 3: AUTO RESOLVE (AI/GPT Only)
+    
+    1. Fetches UNSETTLED trades
+    2. For high-confidence AI matches (>= ConfidenceThreshold.MEDIUM):
+        - Creates MATCH proposals
+    3. For ambiguous matches: trade status to MATCHED
        - Sets resolution_type = "AI"
        - Sets resolution_note = <GPT explanation>
     3. Updates holdings and AUC for AI-resolved trades
@@ -479,38 +611,52 @@ def run_auto_resolve(
             
             # PHASE 3 (AIR GAP): AI creates proposals only. No ledger mutation here.
             proposals_created = 0
-            propose_threshold = 0.80  # Create proposals at/above this confidence
+            propose_threshold = ConfidenceThreshold.PROPOSAL_MINIMUM  # Create proposals at/above this confidence
             
-            # Get all open breaks (remaining after Phase 2)
-            open_breaks = db.query(ReconBreak).filter(
-                ReconBreak.tenant_id == user_id,
-                ReconBreak.status == "OPEN"
+            # Get all unsettled trades (remaining after Phase 2)
+            unsettled_trades = db.query(BrokerTrade).filter(
+                BrokerTrade.tenant_id == user_id,
+                (BrokerTrade.status == TradeStatus.UNSETTLED) | (BrokerTrade.status.is_(None))
             ).all()
             
-            if not open_breaks:
-                logger.info(f"No open breaks to resolve - settlement engine already resolved everything")
+            if not unsettled_trades:
+                logger.info(f"No unsettled trades to analyze - settlement engine already resolved everything")
                 return {
                     "status": "success",
-                    "message": "No open breaks remaining - nothing to propose",
+                    "message": "No unsettled trades remaining - nothing to propose",
                     "phase": "PHASE_3_AI_PROPOSAL",
                     "tenant_id": user_id,
                     "ai_results": {
-                        "breaks_analyzed": 0,
+                        "trades_analyzed": 0,
                         "proposals_created": 0,
                         "threshold": propose_threshold
                     }
                 }
             
-            logger.info(f"AI phase: Analyzing {len(open_breaks)} remaining breaks after settlement engine")
+            logger.info(f"AI phase: Analyzing {len(unsettled_trades)} remaining unsettled trades after settlement engine")
             
             try:
                 agent = AIAgent(db, user_id)
 
-                for brk in open_breaks:
-                    if not brk.trade_id:
+                for trade in unsettled_trades:
+                    # Skip if trade is already matched or has a pending proposal
+                    if trade.status == TradeStatus.MATCHED:
+                        continue
+                    
+                    # Check for existing pending proposal for this trade
+                    existing_proposal = (
+                        db.query(ReconProposal)
+                        .filter(
+                            ReconProposal.tenant_id == user_id,
+                            ReconProposal.status == ProposalStatus.PENDING,
+                            ReconProposal.trade_id == trade.id,
+                        )
+                        .first()
+                    )
+                    if existing_proposal:
                         continue
 
-                    analysis = agent.analyze_single_trade(brk.trade_id)
+                    analysis = agent.analyze_single_trade(trade.id)
                     confidence = analysis.get("ai_suggestion", {}).get("confidence", 0) or 0.0
 
                     # CHECK: Is confidence high enough to PROPOSE?
@@ -519,28 +665,36 @@ def run_auto_resolve(
                         explanation = analysis.get("ai_suggestion", {}).get("explanation", "") or ""
 
                         if best_candidate and best_candidate.get("id"):
-                            # Avoid duplicate pending proposals for the same break
-                            existing = (
+                            # Avoid duplicate pending proposals for the same trade-cash pair
+                            existing_specific_proposal = (
                                 db.query(ReconProposal)
                                 .filter(
                                     ReconProposal.tenant_id == user_id,
-                                    ReconProposal.status == "PENDING",
-                                    ReconProposal.break_id == brk.id,
+                                    ReconProposal.status == ProposalStatus.PENDING,
+                                    ReconProposal.trade_id == trade.id,
+                                    ReconProposal.cash_id == best_candidate.get("id"),
                                 )
                                 .first()
                             )
-                            if existing:
+                            if existing_specific_proposal:
                                 continue
 
+                            # Find any open break associated with this trade
+                            associated_break = db.query(ReconBreak).filter(
+                                ReconBreak.tenant_id == user_id,
+                                ReconBreak.trade_id == trade.id,
+                                ReconBreak.status == BreakStatus.OPEN
+                            ).first()
+                            
                             proposal = ReconProposal(
                                 tenant_id=user_id,
-                                trade_id=brk.trade_id,
+                                trade_id=trade.id,
                                 cash_id=best_candidate.get("id"),
-                                break_id=brk.id,
+                                break_id=associated_break.id if associated_break else None,
                                 confidence=float(confidence),
                                 explanation=explanation[:500],
                                 source_model="AI_AGENT",
-                                status="PENDING",
+                                status=ProposalStatus.PENDING,
                                 created_by="AI_AGENT",  # System-generated
                             )
                             db.add(proposal)
@@ -558,7 +712,7 @@ def run_auto_resolve(
                                 entity_id=proposal.id,
                                 actor="AI_AGENT",
                                 payload={
-                                    "trade_id": brk.trade_id,
+                                    "trade_id": trade.id,
                                     "cash_id": best_candidate.get("id"),
                                     "confidence": float(confidence),
                                     "source_model": "AI_AGENT",
@@ -585,7 +739,7 @@ def run_auto_resolve(
                 "tenant_id": user_id,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "ai_results": {
-                    "breaks_analyzed": len(open_breaks),
+                    "trades_analyzed": len(unsettled_trades),
                     "resolved": 0,  # air-gap: nothing committed here
                     "proposals_created": proposals_created,
                     "threshold": propose_threshold,
@@ -604,7 +758,9 @@ def run_auto_resolve(
 
 @router.post("/run")
 def run_reconciliation_process_legacy(
+    request: Request, # Added for CSRF
     background_tasks: BackgroundTasks,
+    csrf_protect: CsrfProtect = Depends(), # Added for CSRF
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -615,7 +771,9 @@ def run_reconciliation_process_legacy(
     This runs ONLY deterministic rules (not AI).
     For AI resolution, call /auto-resolve after this completes.
     """
-    return run_settlement_engine(background_tasks, user_id, db)
+    # Enforce CSRF protection for this legacy endpoint
+    csrf_protect.validate_csrf(request)
+    return run_settlement_engine(request, background_tasks, user_id, db, csrf_protect)
 
 def _get_resolution_type(bank_ref: str) -> str:
     """
@@ -695,15 +853,15 @@ def get_trades(
         if status:
             status_upper = status.upper()
             # Special-case BREAK: it's derived from UNSETTLED + open ReconBreak, not stored on BrokerTrade.status
-            if status_upper == "BREAK":
+            if status_upper == TradeStatus.BREAK:
                 query = query.filter(
-                    (BrokerTrade.status == "UNSETTLED") | (BrokerTrade.status.is_(None))
+                    (BrokerTrade.status == TradeStatus.UNSETTLED) | (BrokerTrade.status.is_(None))
                 ).filter(
                     db.query(ReconBreak.id)
                     .filter(
                         ReconBreak.trade_id == BrokerTrade.id,
                         ReconBreak.tenant_id == user_id,
-                        ReconBreak.status == "OPEN",
+                        ReconBreak.status == BreakStatus.OPEN,
                     )
                     .exists()
                 )
@@ -739,37 +897,39 @@ def get_trades(
         formatted_trades = []
         
         for t in trades:
-            # CRITICAL FIX:
-            # Frontend expects `status` to be a string (React cannot render objects as children).
-            # Extra structured info is emitted via `break_details`.
-            status_str = t.status
+            # Determine status string
+            status_str = t.status or TradeStatus.UNSETTLED
             break_details = None
             resolution_type = None
+            resolution_note = None
 
-            if t.status == "MATCHED":
-                status_str = "MATCHED"
+            if status_str == TradeStatus.MATCHED:
+                status_str = TradeStatus.MATCHED
                 resolution_type = _get_resolution_type(t.bank_ref)
-            elif t.status == "UNSETTLED" or t.status is None:
-                has_break = db.query(ReconBreak).filter_by(trade_id=t.id, status="OPEN").first()
+                if t.bank_ref:
+                    if ":" in t.bank_ref:
+                         resolution_note = t.bank_ref.split(":", 1)[1].strip()
+                    else:
+                         resolution_note = t.bank_ref
+            
+            elif status_str == TradeStatus.UNSETTLED:
+                # Check for breaks
+                has_break = db.query(ReconBreak).filter_by(trade_id=t.id, status=BreakStatus.OPEN).first()
                 if has_break:
-                    status_str = "BREAK"
+                    status_str = TradeStatus.BREAK
                     break_details = {
                         "break_type": has_break.break_type,
                         "severity": has_break.severity.value if has_break.severity else "MEDIUM",
                         "break_id": has_break.id,
                     }
                 else:
-                    status_str = "UNSETTLED"
-            else:
-                status_str = t.status or "UNSETTLED"
-            
-            # Extract resolution note (only for MATCHED trades - phase separation)
-            resolution_note = None
-            if t.status == "MATCHED" and t.bank_ref:
-                if ":" in t.bank_ref:
-                    resolution_note = t.bank_ref.split(":", 1)[1].strip()
-                else:
-                    resolution_note = t.bank_ref
+                    # Check for pending proposals
+                    has_proposal = db.query(ReconProposal).filter(
+                        ReconProposal.trade_id == t.id,
+                        ReconProposal.status == ProposalStatus.PENDING
+                    ).first()
+                    if has_proposal:
+                        status_str = TradeStatus.PROPOSED
             
             formatted_trades.append({
                 "id": t.id,
@@ -779,11 +939,11 @@ def get_trades(
                 "quantity": float(to_decimal(t.quantity)),
                 "price": float(to_decimal(t.price)),
                 "amount": float(to_decimal(t.amount)),
-                "status": status_str,  # <-- always a string (prevents React crash)
-                "break_details": break_details,  # <-- structured details for UI
+                "status": status_str,
+                "break_details": break_details,
                 "resolution_type": resolution_type,
                 "resolution_note": resolution_note,
-                "bank_ref": t.bank_ref if t.status == "MATCHED" else None,  # Only expose after reconciliation
+                "bank_ref": t.bank_ref if t.status == TradeStatus.MATCHED else None,
                 "currency": t.currency or "INR",
                 "source_file": t.source_file,
             })
@@ -809,6 +969,86 @@ def get_trades(
             status_code=500,
             detail=f"Failed to fetch trades: {str(e)}"
         )
+
+
+@router.post("/proposals/approve/{proposal_id}")
+def approve_proposal(
+    request: Request,
+    proposal_id: int,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
+):
+    """Approve a specific proposal."""
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
+    proposal = db.query(ReconProposal).filter_by(id=proposal_id, tenant_id=user_id).first()
+    if not proposal:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+
+    if proposal.status != ProposalStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Only pending proposals can be approved")
+
+    # Maker-checker enforcement: creator cannot approve their own proposal
+    if proposal.created_by and proposal.created_by == user_id:
+        raise HTTPException(status_code=403, detail="Cannot approve your own proposal (maker-checker policy)")
+
+    # Apply the proposal
+    trade = db.query(BrokerTrade).filter_by(id=proposal.trade_id, tenant_id=user_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Associated trade not found")
+
+    if trade.status == TradeStatus.MATCHED:
+        proposal.status = ProposalStatus.REJECTED # Mark as rejected if trade already matched
+        proposal.processed_at = datetime.utcnow()
+        proposal.approved_by = user_id
+        proposal.approved_at = datetime.utcnow()
+        db.commit()
+        raise HTTPException(status_code=400, detail="Trade already matched, proposal rejected.")
+
+    trade.status = TradeStatus.MATCHED
+    trade.bank_ref = f"AI_COMMIT:{(proposal.explanation or '')[:100]} (conf: {float(proposal.confidence or 0):.2f})"
+
+    if proposal.cash_id:
+        cash = db.query(BankTxn).filter_by(id=proposal.cash_id, tenant_id=user_id).first()
+        if cash:
+            cash.status = TradeStatus.MATCHED
+            cash.trade_ref = trade.id
+
+    if proposal.break_id:
+        brk = db.query(ReconBreak).filter_by(id=proposal.break_id, tenant_id=user_id).first()
+        if brk:
+            brk.status = BreakStatus.RESOLVED
+            brk.resolution_note = "Approved from AI Proposal"
+
+    proposal.status = ProposalStatus.APPROVED
+    proposal.processed_at = datetime.utcnow()
+    proposal.approved_by = user_id
+    proposal.approved_at = datetime.utcnow()
+
+    _audit(
+        db=db,
+        tenant_id=user_id,
+        event_type="PROPOSAL_APPROVED",
+        entity_type="PROPOSAL",
+        entity_id=proposal.id,
+        actor=user_id,
+        payload={
+            "trade_id": trade.id,
+            "trade_symbol": trade.symbol,
+            "trade_amount": float(trade.amount) if trade.amount else 0,
+            "cash_id": proposal.cash_id,
+            "confidence": float(proposal.confidence) if proposal.confidence else 0,
+            "source_model": proposal.source_model,
+            "created_by": proposal.created_by,
+        },
+        run_id=proposal.run_id,
+        actor_role="OPS_ANALYST",
+    )
+
+    db.commit()
+
+    return {"status": "success", "message": f"Proposal {proposal_id} approved and applied."}
 
 
 @router.get("/trades/all")
@@ -904,20 +1144,20 @@ def get_workflow_status(
         
         # Count unsettled trades
         unsettled_trades = db.execute(
-            text("""
+            text(f"""
                 SELECT COUNT(*) FROM broker_trades 
                 WHERE tenant_id = :tid 
-                AND (status = 'UNSETTLED' OR status IS NULL)
+                AND (status = '{TradeStatus.UNSETTLED}' OR status IS NULL)
             """),
             {"tid": user_id}
         ).scalar() or 0
         
         # Count open breaks
         open_breaks = db.execute(
-            text("""
+            text(f"""
                 SELECT COUNT(*) FROM recon_breaks 
                 WHERE tenant_id = :tid 
-                AND status = 'OPEN'
+                AND status = '{BreakStatus.OPEN}'
             """),
             {"tid": user_id}
         ).scalar() or 0
@@ -927,7 +1167,7 @@ def get_workflow_status(
             db.query(ReconProposal)
             .filter(
                 ReconProposal.tenant_id == user_id,
-                ReconProposal.status == "PENDING",
+                ReconProposal.status == ProposalStatus.PENDING,
             )
             .count()
         )
@@ -1023,7 +1263,7 @@ def get_breaks(
     try:
         breaks = db.query(ReconBreak).filter(
             ReconBreak.tenant_id == user_id,
-            ReconBreak.status == "OPEN"
+            ReconBreak.status == BreakStatus.OPEN
         ).all()
         
         break_list = []
@@ -1107,10 +1347,10 @@ def get_dashboard_stats(
         # Total pending = trades that are NOT MATCHED.
         # We do NOT add open breaks to this, because every break belongs to an unsettled trade.
         pending_count = db.execute(
-            text("""
+            text(f"""
                 SELECT COUNT(*) FROM broker_trades
                 WHERE tenant_id = :tid
-                  AND (status != 'MATCHED' OR status IS NULL)
+                  AND (status != '{TradeStatus.MATCHED}' OR status IS NULL)
             """),
             {"tid": user_id},
         ).scalar() or 0
@@ -1120,7 +1360,7 @@ def get_dashboard_stats(
             db.query(ReconProposal)
             .filter(
                 ReconProposal.tenant_id == user_id,
-                ReconProposal.status == "PENDING",
+                ReconProposal.status == ProposalStatus.PENDING,
             )
             .count()
         )
@@ -1133,7 +1373,7 @@ def get_dashboard_stats(
             button_to_show = None
         else:
             open_breaks_count = db.execute(
-                text("SELECT COUNT(*) FROM recon_breaks WHERE tenant_id = :tid AND status = 'OPEN'"),
+                text(f"SELECT COUNT(*) FROM recon_breaks WHERE tenant_id = :tid AND status = '{BreakStatus.OPEN}'"),
                 {"tid": user_id},
             ).scalar() or 0
             settlement_ran = (rule_matches > 0) or (open_breaks_count > 0)
@@ -1158,15 +1398,15 @@ def get_dashboard_stats(
         # Get trade statistics
         trade_stats = db.query(
             func.count(BrokerTrade.id).label("total"),
-            func.sum(case((BrokerTrade.status == "MATCHED", 1), else_=0)).label("settled"),
+            func.sum(case((BrokerTrade.status == TradeStatus.MATCHED, 1), else_=0)).label("settled"),
             func.sum(BrokerTrade.amount).label("total_amount"),
         ).filter(BrokerTrade.tenant_id == user_id).first()
 
         # Get cash statistics
         cash_stats = db.query(
             func.count(BankTxn.id).label("total"),
-            func.sum(case((BankTxn.status == "MATCHED", 1), else_=0)).label("used"),
-            func.sum(case((BankTxn.status == "UNUSED", 1), else_=0)).label("unused"),
+            func.sum(case((BankTxn.status == TradeStatus.MATCHED, 1), else_=0)).label("used"),
+            func.sum(case((BankTxn.status == TradeStatus.UNSETTLED, 1), else_=0)).label("unused"),
             func.sum(BankTxn.amount).label("total_amount"),
         ).filter(BankTxn.tenant_id == user_id).first()
 
@@ -1187,8 +1427,8 @@ def get_dashboard_stats(
         # Get break statistics
         break_stats = db.query(
             func.count(ReconBreak.id).label("total"),
-            func.sum(case((ReconBreak.status == "OPEN", 1), else_=0)).label("open"),
-            func.sum(case((ReconBreak.status == "RESOLVED", 1), else_=0)).label("resolved"),
+            func.sum(case((ReconBreak.status == BreakStatus.OPEN, 1), else_=0)).label("open"),
+            func.sum(case((ReconBreak.status == BreakStatus.RESOLVED, 1), else_=0)).label("resolved"),
         ).filter(ReconBreak.tenant_id == user_id).first()
 
         open_breaks = break_stats.open or 0
@@ -1288,13 +1528,17 @@ def get_dashboard_stats(
 
 @router.post("/position-recon")
 def run_position_recon(
+    request: Request,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> List[Dict[str, Any]]:
     """
     Run position reconciliation for holdings.
     Returns holdings data in frontend-compatible format.
     """
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
     try:
         holdings = db.query(Holding).filter(
             Holding.tenant_id == user_id
@@ -1321,6 +1565,32 @@ def run_position_recon(
             status_code=500,
             detail=f"Failed to fetch positions: {str(e)}"
         )
+
+@router.delete("/data/reset")
+def reset_tenant_data(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
+):
+    """
+    Hard Reset: Deletes all data for the current tenant.
+    """
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
+    try:
+        _reset_tenant_data(db, user_id)
+        db.commit()
+        return {
+            "status": "success",
+            "message": "All tenant data reset successfully",
+            "tenant_id": user_id
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to reset tenant data: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to reset tenant data: {str(e)}")
+
 
 @router.get("/nav")
 def get_nav_data(
@@ -1369,6 +1639,7 @@ def run_ai_resolve_legacy(
     
     Kept for backward compatibility with existing frontend code.
     """
+    # This endpoint is deprecated and will be removed. Not adding CSRF here.
     return {
         "status": "deprecated",
         "message": "This endpoint is deprecated. Please use /auto-resolve instead, which performs both deterministic rules and AI reasoning.",
@@ -1377,8 +1648,10 @@ def run_ai_resolve_legacy(
 
 @router.post("/ai-resolve-standalone")
 def run_ai_resolve_standalone(
+    request: Request, # Added for CSRF
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(), # Added for CSRF
 ) -> Dict[str, Any]:
     """
     LEGACY STANDALONE AI RESOLVE (for testing/development only).
@@ -1400,8 +1673,11 @@ def run_ai_resolve_standalone(
     NOTE (v2.1 PROPOSAL-ONLY MODE):
     Holdings are NOT updated. Aureon outputs diffs only.
     """
+    # Enforce CSRF protection
+    csrf_protect.validate_csrf(request)
     # Configurable threshold - can be adjusted based on risk tolerance
-    AUTO_RESOLVE_THRESHOLD = 0.85  # Lowered from 0.9 to allow more auto-resolutions
+    # Use centralized constant for threshold
+    AUTO_RESOLVE_THRESHOLD = ConfidenceThreshold.HIGH
     
     try:
         agent = AIAgent(db, user_id)
@@ -1409,7 +1685,7 @@ def run_ai_resolve_standalone(
         # Get all open breaks with associated trades
         open_breaks = db.query(ReconBreak).filter(
             ReconBreak.tenant_id == user_id,
-            ReconBreak.status == "OPEN"
+            ReconBreak.status == BreakStatus.OPEN
         ).all()
         
         logger.info(f"AI Auto-Resolve: Processing {len(open_breaks)} open breaks for tenant {user_id}")
@@ -1455,9 +1731,9 @@ def run_ai_resolve_standalone(
                     tenant_id=user_id
                 ).first()
                 
-                if trade and trade.status != "MATCHED":
+                if trade and trade.status != TradeStatus.MATCHED:
                     # Update trade status
-                    trade.status = "MATCHED"
+                    trade.status = TradeStatus.MATCHED
                     trade.bank_ref = f"AI:{explanation[:50]}... (conf: {confidence:.2f})"
                     
                     # Update cash status if we have a match
@@ -1468,11 +1744,11 @@ def run_ai_resolve_standalone(
                             tenant_id=user_id
                         ).first()
                         if cash:
-                            cash.status = "MATCHED"
+                            cash.status = TradeStatus.MATCHED
                             cash.trade_ref = trade.id
                     
                     # Mark break as resolved
-                    brk.status = "RESOLVED"
+                    brk.status = BreakStatus.RESOLVED
                     brk.resolution_note = f"AI:{explanation[:150]}"
                     
                     # Track for holdings update
@@ -1486,8 +1762,8 @@ def run_ai_resolve_standalone(
                         trade_id=trade.id,
                         cash_id=cash_id,
                         reason=f"AUTO_RESOLVE: {explanation[:150]}",
-                        status_before="UNSETTLED",
-                        status_after="MATCHED",
+                        status_before=TradeStatus.UNSETTLED,
+                        status_after=TradeStatus.MATCHED,
                         agent_model=f"AI_AGENT (conf: {confidence:.2f})",
                     )
                     db.add(audit_log)
@@ -1503,8 +1779,8 @@ def run_ai_resolve_standalone(
                     tenant_id=user_id,
                     trade_id=brk.trade_id,
                     reason=f"AI_REVIEW_NEEDED: {explanation[:100]}",
-                    status_before="OPEN",
-                    status_after="REVIEW",
+                    status_before=BreakStatus.OPEN,
+                    status_after=BreakStatus.REVIEW,
                     agent_model=f"AI_AGENT (conf: {confidence:.2f})",
                 )
                 db.add(audit_log)
@@ -1544,10 +1820,14 @@ def run_ai_resolve_standalone(
 
 @router.post("/resolve-manual/{trade_id}")
 def resolve_manual_no_body(
+    request: Request,
     trade_id: int,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
     """
     Convenience endpoint for the Glass Box UI.
 
@@ -1558,12 +1838,14 @@ def resolve_manual_no_body(
     NOTE: This wraps the existing /resolve-trade/{trade_id} endpoint.
     """
     payload = ManualResolveRequest(cash_id=None, note="Manual Resolve")
-    return manual_resolve_trade(trade_id=trade_id, payload=payload, user_id=user_id, db=db)
+    return manual_resolve_trade(request=request, trade_id=trade_id, payload=payload, user_id=user_id, db=db, csrf_protect=csrf_protect)
 
 
 @router.post("/resolve-bulk")
 def resolve_bulk_trades(
+    request: Request, # Added for CSRF
     payload: BulkResolveRequest,
+    csrf_protect: CsrfProtect = Depends(), # Added for CSRF
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -1575,6 +1857,8 @@ def resolve_bulk_trades(
     - Attempts to resolve each trade independently
     - Continues on failures (partial success)
     """
+    # Enforce CSRF protection
+    csrf_protect.validate_csrf(request)
     resolved_count = 0
     errors: List[str] = []
     warnings: List[str] = []
@@ -1586,10 +1870,12 @@ def resolve_bulk_trades(
         try:
             single_req = ManualResolveRequest(note=payload.note)
             res = manual_resolve_trade(
+                request=request, # Pass request for CSRF
                 trade_id=trade_id,
                 payload=single_req,
                 user_id=user_id,
                 db=db,
+                csrf_protect=csrf_protect, # Pass csrf_protect
             )
 
             # manual_resolve_trade can return {"status": "warning"} if already resolved
@@ -1633,7 +1919,7 @@ def commit_proposals(
                 db.query(ReconProposal)
                 .filter(
                     ReconProposal.tenant_id == user_id,
-                    ReconProposal.status == "PENDING",
+                    ReconProposal.status == ProposalStatus.PENDING,
                     ReconProposal.confidence >= threshold,
                 )
                 .all()
@@ -1658,29 +1944,29 @@ def commit_proposals(
                         # Note: Temporal separation is enforced by setting approved_at when approving.
                         # The sequence (created_at < approved_at) is guaranteed by timestamp logic.
                         now = datetime.utcnow()
-                        
-                        trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).first()
-                        if not trade or trade.status == "MATCHED":
-                            p.status = "REJECTED"
+                        # Double-check status (concurrency safety)
+                        trade = db.query(BrokerTrade).filter_by(id=p.trade_id, tenant_id=user_id).with_for_update().first()
+                        if not trade or trade.status == TradeStatus.MATCHED:
+                            p.status = ProposalStatus.REJECTED
                             p.processed_at = now
                             continue
 
-                        trade.status = "MATCHED"
+                        trade.status = TradeStatus.MATCHED
                         trade.bank_ref = f"AI_COMMIT:{(p.explanation or '')[:100]} (conf: {float(p.confidence or 0):.2f})"
 
                         if p.cash_id:
                             cash = db.query(BankTxn).filter_by(id=p.cash_id, tenant_id=user_id).first()
                             if cash:
-                                cash.status = "MATCHED"
+                                cash.status = TradeStatus.MATCHED
                                 cash.trade_ref = trade.id
 
                         if p.break_id:
                             brk = db.query(ReconBreak).filter_by(id=p.break_id, tenant_id=user_id).first()
                             if brk:
-                                brk.status = "RESOLVED"
+                                brk.status = BreakStatus.RESOLVED
                                 brk.resolution_note = "Auto-Commited from AI Proposal"
 
-                        p.status = "APPROVED"
+                        p.status = ProposalStatus.APPROVED
                         p.processed_at = now
                         p.approved_by = user_id  # v2.1 Maker-checker audit
                         p.approved_at = now      # v2.1 Temporal separation proof
@@ -1758,16 +2044,23 @@ def preview_proposals(
     
     Use this to inspect proposals before calling /proposals/commit.
     """
+    # Enforce CSRF? No this is GET.
+    
+    # Confidence bands using centralized constants
+    confidence_bands = {"high": 0, "medium": 0, "low": 0}
+    
     proposals = (
         db.query(ReconProposal)
         .filter(
             ReconProposal.tenant_id == user_id,
-            ReconProposal.status == "PENDING",
+            ReconProposal.status == ProposalStatus.PENDING,
             ReconProposal.confidence >= min_confidence,
         )
         .order_by(ReconProposal.confidence.desc())
         .all()
     )
+    
+    preview_data = []
     
     preview_data = []
     # Confidence bands using centralized constants
@@ -2046,12 +2339,74 @@ def verify_audit_chain(
     }
 
 
+@router.post("/break/resolve/{break_id}")
+def resolve_break(
+    request: Request,
+    break_id: int,
+    resolution: BreakResolutionRequest = Body(...),
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
+) -> Dict[str, Any]:
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
+    """
+    Manual resolution endpoint used by BreakDrawer.
+    Allows analysts to match a trade to a cash entry or mark it settled with a note.
+    
+    NOTE (v2.1 PROPOSAL-ONLY MODE):
+    """
+    brk = db.query(ReconBreak).filter_by(id=break_id, tenant_id=user_id).first()
+    if not brk:
+        raise HTTPException(status_code=404, detail="Break not found")
+
+    if brk.status != BreakStatus.OPEN:
+        return {
+            "status": "warning",
+            "message": f"Break {break_id} is already {brk.status}",
+            "break_id": break_id,
+        }
+
+    brk.status = resolution.status
+    brk.resolution_note = resolution.resolution_note or f"Manually {resolution.status}"
+    brk.resolved_at = datetime.utcnow()
+    brk.resolved_by = user_id
+
+    _audit(
+        db=db,
+        tenant_id=user_id,
+        event_type="BREAK_RESOLVED",
+        entity_type="BREAK",
+        entity_id=brk.id,
+        actor=user_id,
+        payload={
+            "trade_id": brk.trade_id,
+            "cash_id": brk.cash_id,
+            "break_type": brk.break_type,
+            "status": brk.status,
+            "resolution_note": brk.resolution_note,
+        },
+        actor_role="OPS_ANALYST",
+    )
+
+    db.commit()
+
+    return {
+        "status": "success",
+        "message": f"Break {break_id} marked as {resolution.status}",
+        "break_id": break_id,
+        "new_status": resolution.status,
+    }
+
+
 @router.post("/resolve-trade/{trade_id}")
 def manual_resolve_trade(
+    request: Request, # Added for CSRF
     trade_id: int,
     payload: ManualResolveRequest,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(), # Added for CSRF
 ) -> Dict[str, Any]:
     """
     Manual resolution endpoint used by BreakDrawer.
@@ -2471,12 +2826,12 @@ def export_reconciliation_report(
 
             for t, brk, cash in rows:
                 # Status (BREAK is derived)
-                status = t.status or "UNSETTLED"
-                if status in ("UNSETTLED", None) and brk is not None:
-                    status = "BREAK"
+                status = t.status or TradeStatus.UNSETTLED
+                if status in (TradeStatus.UNSETTLED, None) and brk is not None:
+                    status = TradeStatus.BREAK
 
                 # Resolution type + note
-                resolution_type = "PENDING"
+                resolution_type = None
                 resolution_note = ""
                 ai_conf = None
 

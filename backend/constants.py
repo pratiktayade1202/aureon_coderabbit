@@ -8,6 +8,7 @@ from enum import Enum
 
 class ConfidenceThreshold:
     """AI confidence thresholds for matching decisions."""
+    EXACT_MATCH = 0.99
     HIGH = 0.95
     MEDIUM = 0.85
     LOW = 0.70
@@ -20,6 +21,7 @@ class TradeStatus:
     UNSETTLED = "UNSETTLED"
     BREAK = "BREAK"
     PARTIAL = "PARTIAL"
+    PROPOSED = "PROPOSED"
 
 
 class ProposalStatus:
@@ -28,6 +30,13 @@ class ProposalStatus:
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
+
+
+class BreakStatus:
+    """Reconciliation break status values."""
+    OPEN = "OPEN"
+    RESOLVED = "RESOLVED"
+    REVIEW = "REVIEW"
 
 
 class BreakSeverityLevel:

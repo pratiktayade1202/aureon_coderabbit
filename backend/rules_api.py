@@ -1,7 +1,8 @@
 # backend/rules_api.py
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi_csrf_protect import CsrfProtect
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -41,10 +42,13 @@ def list_rules(
 
 @router.post("/activate/{rule_id}")
 def activate_rule(
+    request: Request,
     rule_id: str,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user),
+    csrf_protect: CsrfProtect = Depends(),
 ):
+    csrf_protect.validate_csrf(request)
     res = db.execute(
         text(
             """
@@ -64,10 +68,13 @@ def activate_rule(
 
 @router.post("/deactivate/{rule_id}")
 def deactivate_rule(
+    request: Request,
     rule_id: str,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user),
+    csrf_protect: CsrfProtect = Depends(),
 ):
+    csrf_protect.validate_csrf(request)
     res = db.execute(
         text(
             """
@@ -87,10 +94,13 @@ def deactivate_rule(
 
 @router.post("/create")
 def create_rule(
+    request: Request,
     payload: RuleCreate,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user),
+    csrf_protect: CsrfProtect = Depends(),
 ):
+    csrf_protect.validate_csrf(request)
     try:
         db.execute(
             text(

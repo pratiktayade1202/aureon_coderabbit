@@ -9,9 +9,10 @@ from typing import Dict, Any, List
 import logging
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from fastapi_csrf_protect import CsrfProtect
 
 from .database import get_db
 from .auth import get_current_user
@@ -136,8 +137,10 @@ def get_training_examples(
 
 @router.post("/learned-rules/train")
 def train_learned_rules(
+    request: Request,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
     """
     Trigger training of learned rules using Neural Core.
@@ -150,6 +153,8 @@ def train_learned_rules(
     2. Analyze patterns using AI
     3. Store learned rules in rule_memory
     """
+    # Enforce CSRF
+    csrf_protect.validate_csrf(request)
     try:
         # First, check if there are any training examples
         example_count = db.query(LearningEvent).filter(
