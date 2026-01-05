@@ -405,10 +405,13 @@ class StartSessionResponse(BaseModel):
 
 @router.post("/sessions", response_model=StartSessionResponse)
 async def start_ingestion_session(
+    request: Request,
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ):
+    csrf_protect.validate_csrf(request)
     """
     Stage 1: UPLOAD (The Airlock)
     - Saves file to secure staging (DB blob for now, S3 later).
@@ -555,10 +558,13 @@ class ApproveContractRequest(BaseModel):
 
 @router.post("/contracts/{contract_id}/approve")
 def approve_contract(
+    request: Request,
     payload: ApproveContractRequest,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ):
+    csrf_protect.validate_csrf(request)
     """
     Stage 4: APPROVE (The Digital Signature)
     User signs the contract (potential overrides included).

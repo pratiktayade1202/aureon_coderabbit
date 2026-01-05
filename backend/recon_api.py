@@ -197,10 +197,13 @@ def _audit(
 
 @router.post("/runs/create")
 def create_reconciliation_run(
+    request: Request,
     payload: CreateRunRequest,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     Create a new reconciliation run with client-supplied ID.
     
@@ -311,10 +314,13 @@ def create_break(
 
 @router.post("/runs/{run_id}/complete")
 def mark_run_complete(
+    request: Request,
     run_id: str,
     user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     Mark a reconciliation run as complete.
     
@@ -1628,9 +1634,12 @@ def get_nav_data(
 
 @router.post("/ai-resolve")
 def run_ai_resolve_legacy(
+    request: Request,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     DEPRECATED: Use /auto-resolve instead.
     
@@ -2120,15 +2129,15 @@ def preview_proposals(
             "medium_confidence": confidence_bands["medium"],
             "low_confidence": confidence_bands["low"],
             "recommendation": (
-                f"Safe to commit {confidence_bands['high']} high-confidence proposals (>= 0.95). "
+                f"Safe to commit {confidence_bands['high']} high-confidence proposals (>= {ConfidenceThreshold.HIGH}). "
                 f"Review {confidence_bands['medium']} medium-confidence proposals."
             ) if preview_data else "No pending proposals found.",
         },
         "proposals": preview_data,
         "next_steps": [
             "Review proposals above",
-            "To commit high-confidence: POST /proposals/commit?min_confidence=0.95",
-            "To commit all: POST /proposals/commit?min_confidence=0.80",
+            f"To commit high-confidence: POST /proposals/commit?min_confidence={ConfidenceThreshold.HIGH}",
+            f"To commit all: POST /proposals/commit?min_confidence={ConfidenceThreshold.PROPOSAL_MINIMUM}",
             "To export: GET /proposals/export",
         ],
     }
@@ -2425,7 +2434,7 @@ def manual_resolve_trade(
         raise HTTPException(status_code=404, detail="Trade not found")
 
     # Check if trade is already resolved
-    if trade.status == "MATCHED":
+    if trade.status == TradeStatus.MATCHED:
         return {
             "status": "warning", 
             "message": "Trade is already resolved", 
@@ -2445,21 +2454,21 @@ def manual_resolve_trade(
     note = payload.note or "MANUAL RESOLVE"
     try:
         # Update trade status with MANUAL prefix for resolution tracking
-        trade.status = "MATCHED"
+        trade.status = TradeStatus.MATCHED
         trade.bank_ref = f"MANUAL:{note}"
 
         if cash_record:
-            cash_record.status = "MATCHED"
+            cash_record.status = TradeStatus.MATCHED
             cash_record.trade_ref = trade.id
 
         # Close any open breaks linked to the trade
         open_breaks = db.query(ReconBreak).filter(
             ReconBreak.trade_id == trade.id,
             ReconBreak.tenant_id == user_id,
-            ReconBreak.status == "OPEN",
+            ReconBreak.status == BreakStatus.OPEN,
         ).all()
         for brk in open_breaks:
-            brk.status = "RESOLVED"
+            brk.status = BreakStatus.RESOLVED
             brk.resolution_note = f"MANUAL:{note}"
 
         # Write learning event so Neural Core can retrain later
@@ -2529,9 +2538,12 @@ def manual_resolve_trade(
 
 @router.post("/reset-db")
 def reset_database(
+    request: Request,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     Reset database for the tenant (development/testing only).
     WARNING: This deletes all data for the tenant.
@@ -2555,9 +2567,12 @@ def reset_database(
 
 @router.post("/system/reset")
 def system_reset(
+    request: Request,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     Alias used by frontend system controls.
     """
@@ -2577,9 +2592,12 @@ def system_reset(
 
 @router.post("/system/hard-reset")
 def system_hard_reset(
+    request: Request,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     DEVELOPMENT ONLY: Full schema reset.
     
@@ -2760,7 +2778,7 @@ def export_reconciliation_report(
             )
             .filter(
                 ReconBreak.tenant_id == user_id,
-                ReconBreak.status == "OPEN",
+                ReconBreak.status == BreakStatus.OPEN,
             )
             .group_by(ReconBreak.trade_id)
             .subquery()
@@ -2835,7 +2853,7 @@ def export_reconciliation_report(
                 resolution_note = ""
                 ai_conf = None
 
-                if t.status == "MATCHED":
+                if t.status == TradeStatus.MATCHED:
                     if t.bank_ref and ":" in t.bank_ref:
                         prefix, note = t.bank_ref.split(":", 1)
                         resolution_type = prefix.strip().upper()
