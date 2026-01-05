@@ -353,7 +353,7 @@ class IngestionSession(Base):
     filename = Column(String, nullable=False)
     file_hash = Column(String(64), nullable=False)  # SHA256 deduplication key
     file_size = Column(Integer, nullable=False)
-    storage_path = Column(String, nullable=False)  # S3/MinIO path
+    storage_path = Column(String, nullable=True)  # Nullable after processing
     
     status = Column(String, default="ANALYZING")  # ANALYZING, DRAFT, SIGNED, EXECUTING, COMPLETED, FAILED
     created_at = Column(DateTime, default=datetime.utcnow)
