@@ -372,10 +372,13 @@ async def get_upload_history(
 
 @router.delete("/upload/{file_id}")
 async def delete_uploaded_file(
+    request: Request,
     file_id: int,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    csrf_protect: CsrfProtect = Depends(),
 ) -> dict:
+    csrf_protect.validate_csrf(request)
     """
     Delete a processed file record (for re-upload).
     Note: This only removes the tracking record, not the imported data.

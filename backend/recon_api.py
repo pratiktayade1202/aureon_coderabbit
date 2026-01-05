@@ -2417,6 +2417,7 @@ def manual_resolve_trade(
     db: Session = Depends(get_db),
     csrf_protect: CsrfProtect = Depends(), # Added for CSRF
 ) -> Dict[str, Any]:
+    csrf_protect.validate_csrf(request)
     """
     Manual resolution endpoint used by BreakDrawer.
     Allows analysts to match a trade to a cash entry or mark it settled with a note.
