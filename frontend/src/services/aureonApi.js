@@ -2,6 +2,28 @@
 import { API_BASE_URL } from '../config';
 import { logger } from '../utils/logger';
 
+// CSRF token management
+let csrfToken = null;
+
+/**
+ * Fetch CSRF token from backend.
+ * Called automatically on first state-changing request.
+ */
+export const initCsrfProtection = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/csrf-token`, {
+      credentials: 'include'
+    });
+    if (response.ok) {
+      // Token is set in cookie by backend
+      csrfToken = 'csrf-initialized';
+      logger.debug('CSRF protection initialized');
+    }
+  } catch (e) {
+    logger.warn('CSRF init failed (may be dev mode)');
+  }
+};
+
 const request = async (path, options = {}) => {
   const { token, method = "GET", body } = options;
   const headers = {
@@ -9,9 +31,17 @@ const request = async (path, options = {}) => {
     ...(token && { Authorization: `Bearer ${token}` }),
   };
 
+  // Add CSRF protection for state-changing requests
+  if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
+    if (!csrfToken) {
+      await initCsrfProtection();
+    }
+  }
+
   const config = {
     method,
     headers,
+    credentials: 'include', // Include cookies for CSRF
     ...(body && { body: JSON.stringify(body) }),
   };
 

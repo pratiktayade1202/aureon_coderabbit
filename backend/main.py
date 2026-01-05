@@ -36,6 +36,11 @@ from .database import get_db
 from .rate_limiting import limiter, rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
+# CSRF protection
+from fastapi_csrf_protect import CsrfProtect
+from fastapi_csrf_protect.exceptions import CsrfProtectError
+from .csrf_protection import get_csrf_config  # noqa - registers config
+
 # Initialize logging
 logger = setup_logging(settings.environment)
 
@@ -348,6 +353,25 @@ def system_reset_endpoint(
 
 # Include the main API router
 app.include_router(api_v1)
+
+# --- CSRF TOKEN ENDPOINT ---
+@app.get("/api/v1/csrf-token", tags=["security"])
+async def get_csrf_token(csrf_protect: CsrfProtect = Depends()):
+    """
+    Get a CSRF token for state-changing requests.
+    Frontend should call this on init and include token in X-CSRF-Token header.
+    """
+    response = JSONResponse({"detail": "CSRF token set"})
+    csrf_protect.set_csrf_cookie(response)
+    return response
+
+# CSRF error handler
+@app.exception_handler(CsrfProtectError)
+async def csrf_exception_handler(request: Request, exc: CsrfProtectError):
+    return JSONResponse(
+        status_code=403,
+        content={"status": "error", "message": "CSRF validation failed", "error_code": "CSRF_ERROR"}
+    )
 
 
 # --- BASIC ROUTES ---

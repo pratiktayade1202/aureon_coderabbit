@@ -52,6 +52,12 @@ class Settings(BaseSettings):
         alias="CORS_ORIGINS"
     )
     
+    # === Security Configuration ===
+    secret_key: str = Field(
+        default="dev-secret-key-change-in-production",
+        alias="SECRET_KEY"
+    )
+    
     # === Workers Configuration ===
     workers: int = Field(default=1, alias="WORKERS")
     
