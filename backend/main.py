@@ -356,14 +356,12 @@ app.include_router(api_v1)
 
 # --- CSRF TOKEN ENDPOINT ---
 @app.get("/api/v1/csrf-token", tags=["security"])
-async def get_csrf_token(csrf_protect: CsrfProtect = Depends()):
+async def get_csrf_token():
     """
-    Get a CSRF token for state-changing requests.
-    Frontend should call this on init and include token in X-CSRF-Token header.
+    CSRF endpoint (temporarily returns success without setting token).
+    CSRF validation is disabled during system restoration.
     """
-    response = JSONResponse({"detail": "CSRF token set"})
-    csrf_protect.set_csrf_cookie(response)
-    return response
+    return JSONResponse({"detail": "CSRF disabled temporarily", "csrf_token": "disabled"})
 
 # CSRF error handler
 @app.exception_handler(CsrfProtectError)
