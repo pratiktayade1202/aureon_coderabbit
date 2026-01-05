@@ -1,0 +1,46 @@
+version = 1
+
+test_patterns = [
+  "tests/**",
+  "backend/rule_engine/tests/**"
+]
+
+exclude_patterns = [
+  "**/node_modules/**",
+  "**/venv/**",
+  "**/.git/**",
+  "**/dist/**",
+  "frontend/dist/**",
+  "**/*.min.js",
+  "alembic/versions/**",
+  "*.zip",
+  "*.pdf",
+  "large_stress_data/**",
+  "stress_test_data/**",
+  "legacy/**"
+]
+
+[[analyzers]]
+name = "shell"
+
+[[analyzers]]
+name = "secrets"
+
+[[analyzers]]
+name = "sql"
+
+[[analyzers]]
+name = "docker"
+
+[[analyzers]]
+name = "javascript"
+
+  [analyzers.meta]
+  plugins = ["react"]
+  environment = ["nodejs"]
+
+[[analyzers]]
+name = "python"
+
+  [analyzers.meta]
+  runtime_version = "3.x.x"
