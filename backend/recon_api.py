@@ -20,6 +20,7 @@ from .ai_layer.agent import AIAgent
 from .utils.financial import to_decimal
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
+import hashlib
 
 router = APIRouter(tags=["reconciliation"])
 logger = logging.getLogger(__name__)
@@ -27,49 +28,78 @@ logger = logging.getLogger(__name__)
 # Rate limiting
 from .rate_limiting import limiter, SETTLEMENT_LIMIT, AI_RESOLVE_LIMIT
 
+# Constants
+from .constants import (
+    ConfidenceThreshold,
+    TradeStatus,
+    ProposalStatus,
+    DEFAULT_LOCK_TIMEOUT,
+)
 
-# --- TENANT ISOLATION: MUTEX LOCK HELPER ---
+
+# --- TENANT ISOLATION: MUTEX LOCK WITH ADVISORY LOCKS ---
 @contextmanager
-def acquire_tenant_lock(db: Session, user_id: str, process_name: str, timeout_seconds: int = 300):
+def acquire_tenant_lock(db: Session, user_id: str, process_name: str, timeout_seconds: int = DEFAULT_LOCK_TIMEOUT):
     """
-    Context manager to enforce single-threaded execution per tenant.
-    Raises 409 if locked. Releases lock on exit.
+    Context manager using PostgreSQL advisory locks for atomic tenant isolation.
     
-    PHASE 3: TENANT ISOLATION (The Traffic Cop)
-    Prevents concurrent heavy operations (upload, settlement, AI resolve, commit).
+    Uses pg_try_advisory_lock for atomic lock acquisition (no race conditions).
+    Falls back to metadata table for user feedback on lock holder.
     """
+    # Generate numeric lock ID from tenant_id (PostgreSQL advisory locks need int)
+    lock_id = int(hashlib.md5(user_id.encode()).hexdigest()[:8], 16)
+    
+    # Try to acquire advisory lock (atomic - no race condition)
+    result = db.execute(
+        text("SELECT pg_try_advisory_lock(:lock_id)"),
+        {"lock_id": lock_id}
+    ).scalar()
+    
+    if not result:
+        # Lock failed - check metadata for user feedback
+        existing = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+        now = datetime.utcnow()
+        
+        if existing and existing.locked_until > now:
+            remaining = int((existing.locked_until - now).total_seconds())
+            raise HTTPException(
+                status_code=409,
+                detail=f"System busy: '{existing.process_name}' ({remaining}s remaining)"
+            )
+        else:
+            raise HTTPException(status_code=409, detail="System busy. Please retry.")
+    
+    # Advisory lock acquired - update metadata for visibility
     now = datetime.utcnow()
-    
-    # 1. Check existing lock
-    lock = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
-    
-    if lock and lock.locked_until > now:
-        remaining = int((lock.locked_until - now).total_seconds())
-        raise HTTPException(
-            status_code=409, 
-            detail=f"System is busy processing '{lock.process_name}'. Please wait {remaining} seconds."
-        )
-    
-    # 2. Acquire Lock
     expiry = now + timedelta(seconds=timeout_seconds)
-    if not lock:
-        lock = ReconLock(tenant_id=user_id, locked_until=expiry, process_name=process_name)
-        db.add(lock)
+    
+    lock_record = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+    if not lock_record:
+        lock_record = ReconLock(
+            tenant_id=user_id,
+            process_name=process_name,
+            locked_until=expiry
+        )
+        db.add(lock_record)
     else:
-        lock.locked_until = expiry
-        lock.process_name = process_name
+        lock_record.process_name = process_name
+        lock_record.locked_until = expiry
     
     db.commit()
     
     try:
-        yield  # Allow endpoint to run
+        yield
     finally:
-        # 3. Release Lock (by expiring it immediately)
-        # We fetch again to be safe in case of session weirdness, though usually object is attached
-        lock = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
-        if lock:
-            lock.locked_until = datetime.utcnow()  # Expire it
-            db.commit()
+        # Release advisory lock
+        db.execute(
+            text("SELECT pg_advisory_unlock(:lock_id)"),
+            {"lock_id": lock_id}
+        )
+        # Expire metadata lock
+        lock_record = db.query(ReconLock).filter(ReconLock.tenant_id == user_id).first()
+        if lock_record:
+            lock_record.locked_until = datetime.utcnow()
+        db.commit()
 
 
 class ManualResolveRequest(BaseModel):

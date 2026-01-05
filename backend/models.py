@@ -2,7 +2,7 @@
 
 from sqlalchemy import (
     Column, Integer, String, Float, Date, DateTime, 
-    Boolean, ForeignKey, Text, JSON, Enum, UniqueConstraint
+    Boolean, ForeignKey, Text, JSON, Enum, UniqueConstraint, Numeric, Index
 )
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -42,16 +42,22 @@ class BrokerTrade(Base):
     settlement_date = Column(Date, nullable=True)
     symbol = Column(String, index=True)
     isin = Column(String, index=True)
-    side = Column(String) 
-    quantity = Column(Float)
-    price = Column(Float)
-    amount = Column(Float) 
+    side = Column(String)
+    # Financial columns: Use Numeric for precision (15 total digits, 4 decimal places)
+    quantity = Column(Numeric(15, 4))
+    price = Column(Numeric(15, 4))
+    amount = Column(Numeric(15, 2))  # Money: 2 decimals sufficient
     currency = Column(String, default="INR")
     
     source_file = Column(String)
     status = Column(String, default=ReconStatus.UNSETTLED)
     recon_id = Column(String, nullable=True)
     bank_ref = Column(String, nullable=True)
+    
+    __table_args__ = (
+        Index('idx_broker_tenant_status_date', 'tenant_id', 'status', 'date'),
+        Index('idx_broker_tenant_symbol', 'tenant_id', 'symbol'),
+    )
 
 class BankTxn(Base):
     __tablename__ = "bank_txns"
@@ -62,12 +68,18 @@ class BankTxn(Base):
     date = Column(Date, index=True)
     value_date = Column(Date, nullable=True)
     description = Column(String)
-    amount = Column(Float)
-    balance = Column(Float, nullable=True)
+    # Financial columns: Use Numeric for precision
+    amount = Column(Numeric(15, 2))
+    balance = Column(Numeric(15, 2), nullable=True)
     
     source_file = Column(String)
     status = Column(String, default="UNUSED")
     trade_ref = Column(Integer, ForeignKey("broker_trades.id"), nullable=True)
+    
+    __table_args__ = (
+        Index('idx_bank_tenant_status', 'tenant_id', 'status'),
+        Index('idx_bank_tenant_date', 'tenant_id', 'date'),
+    )
 
 class Holding(Base):
     __tablename__ = "holdings"
@@ -78,11 +90,12 @@ class Holding(Base):
     date = Column(Date, index=True)
     isin = Column(String)
     symbol = Column(String, index=True)
-    quantity = Column(Float)
-    total_value = Column(Float)
+    # Financial columns: Use Numeric for precision
+    quantity = Column(Numeric(15, 4))
+    total_value = Column(Numeric(15, 2))
     
-    avg_cost = Column(Float, default=0.0)
-    market_price = Column(Float, default=0.0)
+    avg_cost = Column(Numeric(15, 4), default=0.0)
+    market_price = Column(Numeric(15, 4), default=0.0)
     source_file = Column(String)
 
     __table_args__ = (
@@ -98,8 +111,9 @@ class NavLog(Base):
     date = Column(Date)
     fund_name = Column(String)
     isin = Column(String, nullable=True)
-    nav_value = Column(Float)
-    aum = Column(Float)
+    # Financial columns: Use Numeric for precision
+    nav_value = Column(Numeric(15, 4))
+    aum = Column(Numeric(15, 2))
     source_file = Column(String)
 
 # --- 2. RULE ENGINE TABLES ---
